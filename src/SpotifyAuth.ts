@@ -54,6 +54,12 @@ export class SpotifyAuth extends Context.Service<SpotifyAuth, {
   readonly beginLogin: Effect.Effect<{ readonly url: string; readonly pkce: PkceChallenge }, NotLoggedIn>
   /** Exchange an authorization code for tokens and persist them. */
   readonly completeLogin: (code: string, pkce: PkceChallenge) => Effect.Effect<void, AuthError>
+  /** Authorize URL that only proves who the visitor is (no scopes, so no new grant). */
+  readonly beginIdentify: Effect.Effect<{ readonly url: string; readonly pkce: PkceChallenge }, NotLoggedIn>
+  /** Exchange an identify code for the visitor's Spotify account. The tokens are discarded. */
+  readonly identify: (code: string, pkce: PkceChallenge) => Effect.Effect<typeof SpMe.Type, AuthError>
+  /** The account this dj belongs to: VIBEQ_OWNER_SPOTIFY_ID, else whoever is linked at /login. */
+  readonly ownerId: Effect.Effect<Option.Option<string>, AuthError>
 }>()("vibeq/SpotifyAuth") {
   static readonly layer = Layer.effect(
     SpotifyAuth,
@@ -128,7 +134,15 @@ export class SpotifyAuth extends Context.Service<SpotifyAuth, {
 
       const invalidate = Ref.update(tokens, Option.map((t) => ({ ...t, expires_at: 0 })))
 
-      const beginLogin = Effect.gen(function*() {
+      const fetchMe = (accessToken: string) =>
+        HttpClientRequest.get("https://api.spotify.com/v1/me").pipe(
+          HttpClientRequest.bearerToken(accessToken),
+          http.execute,
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(SpMe)),
+          Effect.mapError((cause) => new AuthError({ message: `Couldn't verify the Spotify account: ${String(cause)}` }))
+        )
+
+      const authorizeUrl = (scopes: ReadonlyArray<string>) => Effect.gen(function*() {
         if (Option.isNone(config.spotifyClientId)) {
           return yield* new NotLoggedIn({
             message:
@@ -144,12 +158,15 @@ export class SpotifyAuth extends Context.Service<SpotifyAuth, {
           code_challenge_method: "S256",
           code_challenge: pkce.challenge,
           state: pkce.state,
-          scope: SCOPES.join(" ")
+          ...(scopes.length > 0 ? { scope: scopes.join(" ") } : {})
         })
         return { url: `${AUTHORIZE_URL}?${params.toString()}`, pkce }
       })
 
-      const completeLogin = Effect.fnUntraced(function*(code: string, pkce: PkceChallenge) {
+      const beginLogin = authorizeUrl(SCOPES)
+      const beginIdentify = authorizeUrl([])
+
+      const exchangeCode = Effect.fnUntraced(function*(code: string, pkce: PkceChallenge) {
         if (Option.isNone(config.spotifyClientId)) {
           return yield* new AuthError({ message: "No Spotify client id configured" })
         }
@@ -161,14 +178,35 @@ export class SpotifyAuth extends Context.Service<SpotifyAuth, {
           client_id: clientId,
           code_verifier: pkce.verifier
         })
+        return { res, clientId }
+      })
+
+      const identify = (code: string, pkce: PkceChallenge) =>
+        exchangeCode(code, pkce).pipe(Effect.flatMap(({ res }) => fetchMe(res.access_token)))
+
+      // The linked account doesn't change while we run, so look it up once.
+      const linkedId = yield* Ref.make<Option.Option<string>>(Option.none())
+      const ownerId = Option.match(config.ownerSpotifyId, {
+        onSome: (id) => Effect.succeed(Option.some(id)),
+        onNone: () =>
+          Effect.gen(function*() {
+            const cached = yield* Ref.get(linkedId)
+            if (Option.isSome(cached)) return cached
+            if (Option.isNone(yield* Ref.get(tokens))) return Option.none<string>()
+            const token = yield* accessToken.pipe(
+              Effect.mapError((e) => new AuthError({ message: e.message }))
+            )
+            const me = yield* fetchMe(token)
+            yield* Ref.set(linkedId, Option.some(me.id))
+            return Option.some(me.id)
+          })
+      })
+
+      const completeLogin = Effect.fnUntraced(function*(code: string, pkce: PkceChallenge) {
+        const { res, clientId } = yield* exchangeCode(code, pkce)
         // On a public deployment only the owner's account may link itself.
         if (Option.isSome(config.ownerSpotifyId)) {
-          const me = yield* HttpClientRequest.get("https://api.spotify.com/v1/me").pipe(
-            HttpClientRequest.bearerToken(res.access_token),
-            http.execute,
-            Effect.flatMap(HttpClientResponse.schemaBodyJson(SpMe)),
-            Effect.mapError((cause) => new AuthError({ message: `Couldn't verify the Spotify account: ${String(cause)}` }))
-          )
+          const me = yield* fetchMe(res.access_token)
           if (me.id !== config.ownerSpotifyId.value) {
             return yield* new AuthError({ message: "This vibeq belongs to a different Spotify account." })
           }
@@ -183,7 +221,10 @@ export class SpotifyAuth extends Context.Service<SpotifyAuth, {
         invalidate,
         isLoggedIn: Effect.map(Ref.get(tokens), Option.isSome),
         beginLogin,
-        completeLogin
+        completeLogin,
+        beginIdentify,
+        identify,
+        ownerId
       })
     })
   )

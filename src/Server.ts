@@ -1,5 +1,5 @@
 import { BunHttpServer, BunServices } from "@effect/platform-bun"
-import { Effect, Layer, Option, Ref, Schema } from "effect"
+import { Clock, Effect, Layer, Option, Ref, Schema } from "effect"
 import { McpProtocol, McpServer } from "effect/ai"
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { AppConfig } from "./AppConfig.ts"
@@ -18,6 +18,8 @@ import { TrackCache } from "./TrackCache.ts"
 import { type PkceChallenge, SpotifyAuth } from "./SpotifyAuth.ts"
 import { VibeToolkit, VibeToolkitLayer } from "./Tools.ts"
 import { WebRoutes } from "./Web.ts"
+import { page } from "./Html.ts"
+import { bearerOf, McpAuthMiddleware, McpOAuth, OAuthRoutes, secretMatches } from "./OAuth.ts"
 
 export const VERSION = "0.1.0"
 
@@ -52,17 +54,6 @@ export const AppLive = Layer.mergeAll(
 // Routes
 // ---------------------------------------------------------------------------
 
-const page = (title: string, body: string) =>
-  HttpServerResponse.html(
-    `<!doctype html><html><head><meta charset="utf-8"><title>vibeq</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:15vh auto;padding:0 1rem;background:#111;color:#eee}
-h1{color:#1ed760}code{background:#222;padding:.1em .3em;border-radius:4px}</style></head>
-<body><h1>${escapeHtml(title)}</h1><p>${escapeHtml(body)}</p></body></html>`
-  )
-
-const escapeHtml = (s: string) =>
-  s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[c] ?? c)
-
 const CallbackParams = Schema.Struct({
   code: Schema.optional(Schema.String),
   state: Schema.optional(Schema.String),
@@ -90,8 +81,16 @@ export const loginRoutes = (onSuccess: Effect.Effect<void>) =>
       "/callback",
       Effect.gen(function*() {
         const params = yield* HttpServerRequest.schemaSearchParams(CallbackParams)
-        if (params.error !== undefined) return page("Spotify login failed", params.error)
         const pkce = (yield* Ref.get(pending)).get(params.state ?? "")
+        // Not a /login? It may be the Spotify sign-in step of an MCP client's OAuth flow.
+        if (pkce === undefined && params.state !== undefined) {
+          const oauth = yield* Effect.serviceOption(McpOAuth)
+          if (Option.isSome(oauth)) {
+            const handled = yield* oauth.value.spotifyCallback(params.state, params.code, params.error)
+            if (Option.isSome(handled)) return handled.value
+          }
+        }
+        if (params.error !== undefined) return page("Spotify login failed", params.error)
         if (params.code === undefined || pkce === undefined) {
           return page("Login expired", "That login link is stale. Start again from /login.")
         }
@@ -120,7 +119,7 @@ const HealthRoute = HttpRouter.use(Effect.fn(function*(router) {
   )
 }))
 
-const McpLive = McpServer.toolkit(VibeToolkit).pipe(
+const McpLive = Layer.mergeAll(McpServer.toolkit(VibeToolkit), McpAuthMiddleware.layerGlobal).pipe(
   Layer.provide(VibeToolkitLayer),
   Layer.provide(
     McpServer.layerHttp({
@@ -139,25 +138,36 @@ const httpServer = Layer.unwrap(
   Effect.map(AppConfig, (config) => BunHttpServer.layer({ port: config.port, hostname: config.host }))
 )
 
-/** dj's own /mcp controls playback, so on a deployment it requires the proxy secret (open only on 127.0.0.1). */
+/**
+ * dj's own /mcp controls playback. On a deployment it takes dj's secret or an OAuth access token,
+ * and a 401 tells MCP clients where to start the OAuth sign-in. On 127.0.0.1 with no secret it's open.
+ */
 const guardMcp = <E, R>(app: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
   Effect.gen(function*() {
     const request = yield* HttpServerRequest.HttpServerRequest
     if (!request.url.startsWith("/mcp")) return yield* app
     const config = yield* AppConfig
-    const ok = Option.match(config.proxySecret, {
-      onNone: () => config.host === "127.0.0.1",
-      onSome: (secret) => request.headers["authorization"] === `Bearer ${secret}`
-    })
-    return ok ? yield* app : HttpServerResponse.jsonUnsafe({ error: "unauthorized" }, { status: 401 })
+    const oauth = yield* McpOAuth
+    const bearer = bearerOf(request.headers["authorization"])
+    const now = yield* Clock.currentTimeMillis
+    const ok = bearer === undefined
+      ? Option.isNone(config.proxySecret) && config.host === "127.0.0.1"
+      : Option.exists(config.proxySecret, (secret) => secretMatches(bearer, secret)) ||
+        Option.isSome(oauth.verifyAccess(bearer, now))
+    if (ok) return yield* app
+    return HttpServerResponse.jsonUnsafe(
+      { error: bearer === undefined ? "unauthorized" : "invalid_token" },
+      { status: 401, headers: { "www-authenticate": oauth.challenge(bearer !== undefined) } }
+    )
   })
 
 /** The long-running daemon: MCP at /mcp, login at /login, public view at /, plus the feeder. */
 export const DaemonLive = HttpRouter.serve(
-  Layer.mergeAll(McpLive, loginRoutes(Effect.void), HealthRoute, WebRoutes.pipe(Layer.provide(VibeToolkitLayer))),
+  Layer.mergeAll(McpLive, loginRoutes(Effect.void), HealthRoute, OAuthRoutes, WebRoutes.pipe(Layer.provide(VibeToolkitLayer))),
   { middleware: guardMcp }
 ).pipe(
   Layer.provide(httpServer),
+  Layer.provideMerge(McpOAuth.layer),
   Layer.provide(AppLive)
 )
 

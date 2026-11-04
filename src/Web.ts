@@ -1,9 +1,9 @@
 import { Clock, Effect, FileSystem, Option, Path, Stream } from "effect"
 import { Tool } from "effect/ai"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
-import { timingSafeEqual } from "node:crypto"
 import { AppConfig } from "./AppConfig.ts"
-import { CurrentCaller } from "./Caller.ts"
+import { CurrentCaller, READ_ONLY_TOOLS } from "./Caller.ts"
+import { bearerOf, callerName, McpOAuth, secretMatches } from "./OAuth.ts"
 import { Dj } from "./Dj.ts"
 import type { Track } from "./Domain.ts"
 import { SERVER_INSTRUCTIONS } from "./Instructions.ts"
@@ -14,14 +14,9 @@ import { VIEW_HTML } from "./View.ts"
 /**
  * dj's HTTP surface besides /mcp:
  * - public, read-only: `/` (live view), `/api/now`, `/init`, `/api/tools` (catalog)
- * - secret-authenticated: `POST /api/tools/:name` (used by chirp's MCP proxy) and admin import.
+ * - `POST /api/tools/:name`: dj's secret (chirp's proxy, the CLI) or an OAuth access token
+ * - admin import and restart: dj's secret only
  */
-
-/** Tools that only read state; everything else changes playback or stored data. */
-const READ_ONLY = new Set([
-  "now_playing", "search_tracks", "my_taste", "liked_songs", "similar_tracks", "similar_artists", "tag_tracks", "tags",
-  "artist_top_tracks", "listening_history", "listening_stats", "wait_for_event", "find_tracks", "transitions", "playlists"
-])
 
 /** Files an operator may upload to seed a deployment (e.g. from the laptop that ran vibeq before). */
 const IMPORTABLE: Record<string, (home: string, path: Path.Path) => string> = {
@@ -32,12 +27,6 @@ const IMPORTABLE: Record<string, (home: string, path: Path.Path) => string> = {
   "feedback.json": (h, p) => p.join(h, "feedback.json"),
   "session.json": (h, p) => p.join(h, "session.json"),
   "token.json": (h, p) => p.join(h, "token.json")
-}
-
-const secretMatches = (given: string, expected: string) => {
-  const a = Buffer.from(given)
-  const b = Buffer.from(expected)
-  return a.length === b.length && timingSafeEqual(a, b)
 }
 
 const jsonError = (status: number, message: string) =>
@@ -60,15 +49,35 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
   const path = yield* Path.Path
   const toolkit = yield* VibeToolkit
 
-  /** Control requires the proxy secret; with none configured (local dev, bound to 127.0.0.1) it's open. */
-  const authorized = (request: HttpServerRequest.HttpServerRequest) =>
-    Option.match(config.proxySecret, {
-      onNone: () => config.host === "127.0.0.1",
-      onSome: (secret) => {
-        const header = request.headers["authorization"] ?? ""
-        return header.startsWith("Bearer ") && secretMatches(header.slice(7), secret)
-      }
+  const oauth = yield* McpOAuth
+
+  /** Holding dj's secret (or local dev on 127.0.0.1 with no secret) is full, owner-level access. */
+  const holdsSecret = (request: HttpServerRequest.HttpServerRequest) => {
+    const bearer = bearerOf(request.headers["authorization"])
+    return Option.match(config.proxySecret, {
+      onNone: () => bearer === undefined && config.host === "127.0.0.1",
+      onSome: (secret) => bearer !== undefined && secretMatches(bearer, secret)
     })
+  }
+
+  /**
+   * Who may call a tool, and whether they may change things. dj's secret is trusted to forward
+   * chirp's caller and scopes; an OAuth token carries its own app name and scopes.
+   */
+  const toolAccess = (request: HttpServerRequest.HttpServerRequest, now: number) => {
+    if (holdsSecret(request)) {
+      const scopes = request.headers["x-chirp-scopes"]
+      return Option.some({
+        caller: (request.headers["x-chirp-caller"] ?? "owner").slice(0, 200),
+        canWrite: scopes === undefined || scopes.split(",").includes("write")
+      })
+    }
+    const bearer = bearerOf(request.headers["authorization"])
+    return Option.map(
+      bearer === undefined ? Option.none() : oauth.verifyAccess(bearer, now),
+      (c) => ({ caller: callerName(c.client_name), canWrite: c.scope.includes("write") })
+    )
+  }
 
   // --- public ------------------------------------------------------------
   yield* router.add("GET", "/", HttpServerResponse.html(VIEW_HTML))
@@ -115,7 +124,7 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
   const catalog = Object.values(toolkit.tools).map((tool) => ({
     name: tool.name,
     description: Tool.getDescription(tool) ?? "",
-    read_only: READ_ONLY.has(tool.name),
+    read_only: READ_ONLY_TOOLS.has(tool.name),
     input_schema: Tool.getJsonSchema(tool)
   }))
 
@@ -134,8 +143,9 @@ The live queue is public at ${config.publicUrl}/. Controlling playback is for ag
 ## Connect
 
 1. **Through chirp's MCP (preferred).** Agents connected to chirp (https://chirp.cryo.wtf/mcp) get two tools that proxy here with chirp's own auth. \`dj_guide\` returns this document plus every tool's input schema. \`dj\` calls any tool below as \`{tool, arguments}\`. Read tools need read scope; anything that changes playback or stored taste needs write.
-2. **HTTP, for operators.** \`POST ${config.publicUrl}/api/tools/<name>\` with a JSON body of arguments and \`Authorization: Bearer <dj proxy secret>\`. The catalog with JSON schemas is at \`GET ${config.publicUrl}/api/tools\`.
-3. **Public read-only.** \`GET ${config.publicUrl}/api/now\` returns now playing, up next and recent tracks as JSON.
+2. **dj's own MCP, with OAuth.** Add \`${config.publicUrl}/mcp\` to any MCP client (\`claude mcp add --transport http dj ${config.publicUrl}/mcp\`, then authenticate). The owner signs in with Spotify and approves the app, read-only or with changes allowed.
+3. **HTTP, for operators.** \`POST ${config.publicUrl}/api/tools/<name>\` with a JSON body of arguments and \`Authorization: Bearer <dj secret or OAuth access token>\`. The catalog with JSON schemas is at \`GET ${config.publicUrl}/api/tools\`.
+4. **Public read-only.** \`GET ${config.publicUrl}/api/now\` returns now playing, up next and recent tracks as JSON.
 
 ## Tools
 
@@ -155,18 +165,17 @@ ${SERVER_INSTRUCTIONS}
     "/api/tools/:name",
     (request) =>
       Effect.gen(function*() {
-        if (!authorized(request)) return jsonError(401, "unauthorized")
+        const access = toolAccess(request, yield* Clock.currentTimeMillis)
+        if (Option.isNone(access)) return jsonError(401, "unauthorized")
         const params = yield* HttpRouter.params
         const name = params["name"] ?? ""
         if (!Object.hasOwn(toolkit.tools, name)) return jsonError(404, `unknown tool: ${name}`)
-        // Calls proxied from chirp carry the caller's scopes; read-only connections can't change anything.
-        const scopes = request.headers["x-chirp-scopes"]
-        if (scopes !== undefined && !scopes.split(",").includes("write") && !READ_ONLY.has(name)) {
+        // Read-only connections (chirp read scope, read-only OAuth grants) can't change anything.
+        if (!access.value.canWrite && !READ_ONLY_TOOLS.has(name)) {
           return jsonError(403, `${name} changes playback or stored taste and needs write scope`)
         }
         const args = yield* request.json.pipe(Effect.orElseSucceed(() => ({})))
-        // Proxied calls name the chirp agent; direct calls hold dj's secret, so they're the owner.
-        const caller = (request.headers["x-chirp-caller"] ?? "owner").slice(0, 200)
+        const caller = access.value.caller
         yield* Effect.logInfo(`tool ${name} called by ${caller}`)
         // The name is checked against the toolkit above, and the toolkit decodes the untrusted arguments
         // against the tool's own parameter schema before any handler runs, so these casts only bridge
@@ -192,7 +201,7 @@ ${SERVER_INSTRUCTIONS}
     "/api/admin/import/:file",
     (request) =>
       Effect.gen(function*() {
-        if (!authorized(request)) return jsonError(401, "unauthorized")
+        if (!holdsSecret(request)) return jsonError(401, "unauthorized")
         const file = (yield* HttpRouter.params)["file"] ?? ""
         const target = IMPORTABLE[file]
         if (target === undefined) return jsonError(400, `importable files: ${Object.keys(IMPORTABLE).join(", ")}`)
@@ -208,7 +217,7 @@ ${SERVER_INSTRUCTIONS}
     "POST",
     "/api/admin/restart",
     (request) =>
-      authorized(request)
+      holdsSecret(request)
         // Exit after answering; the supervisor (launchd / Railway) restarts us with the imported state.
         ? Effect.sync(() => {
           setTimeout(() => process.exit(1), 300)
