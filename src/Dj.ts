@@ -19,6 +19,9 @@ import { type Resolution, Resolver, type SongRequest } from "./Resolver.ts"
 import { SpotifyApi, SpotifyError, type SpotifyFailure } from "./SpotifyApi.ts"
 import { TrackCache } from "./TrackCache.ts"
 
+/** How often the feeder re-reads Spotify's queue while a track is locked in. */
+const QUEUE_CHECK_EVERY_MS = 25_000
+
 export class DjError extends Schema.TaggedError<DjError>()("DjError", {
   message: Schema.String
 }) {}
@@ -76,6 +79,8 @@ export class Dj extends Context.Service<Dj, {
       const events = yield* Events
       const cache = yield* TrackCache
       const wasPlaying = yield* Ref.make<boolean | undefined>(undefined)
+      /** When the feeder last read Spotify's real queue to confirm the locked-in track. */
+      const lastQueueCheck = yield* Ref.make(0)
 
       const planStats = (s: SessionState) => {
         const upcoming = [...Plan.activeStaged(s).map((x) => x.item), ...s.plan]
@@ -371,15 +376,25 @@ export class Dj extends Context.Service<Dj, {
             yield* Effect.logInfo(`Now playing (${observed.change.entry.source}): ${observed.change.entry.track.name}`)
           }
 
-          // Staged items that never played after a long time were probably lost
-          // (e.g. Spotify's queue was cleared by starting a new context).
-          const stale = next.staged.some((s) => now - s.staged_at > 12 * 60_000)
-          if (stale) {
-            const q = yield* api.queue
-            next = Plan.pruneStaged(next, q.queue.map(toTrack))
+          // Spotify is hiding what's playing (private session, some devices): a staged track may play unseen.
+          const hidden = Option.isNone(view.track)
+          if (hidden) next = Plan.markBlind(next)
+
+          // Devices can silently drop a track dj added over the API (seen with the iOS app), so confirm the
+          // locked-in track is still in Spotify's real queue every ~30s, and add it again if it isn't.
+          const checkDue = next.staged.some((s) => now - s.staged_at >= Plan.QUEUE_GRACE_MS) &&
+            now - (yield* Ref.get(lastQueueCheck)) >= QUEUE_CHECK_EVERY_MS
+          if (checkDue) {
+            yield* Ref.set(lastQueueCheck, now)
+            const queue = yield* Effect.result(api.queue)
+            if (queue._tag === "Success") {
+              const reconciled = Plan.reconcileStaged(next, queue.success.queue.map(toTrack), Option.getOrUndefined(view.track), now)
+              next = reconciled.state
+              yield* Effect.forEach(reconciled.repairs, (repair) => repairQueue(repair, view, next), { discard: true })
+            }
           }
 
-          const playbackInfo = { isPlaying: view.isPlaying, remainingMs: view.remainingMs }
+          const playbackInfo = { isPlaying: view.isPlaying, remainingMs: view.remainingMs, hidden }
           if (observed.change._tag !== "SkipCancelled" && Plan.shouldStage(next, playbackInfo)) {
             const staged = Plan.stageHead(next, now)
             if (staged !== undefined) {
@@ -403,6 +418,48 @@ export class Dj extends Context.Service<Dj, {
           return observed.change._tag === "SkipCancelled" ? 1_500 : Plan.nextDelayMs(next, playbackInfo)
         })
       )
+
+      /** Act on one reconciliation outcome; every outcome is logged and announced, so the driver knows. */
+      const repairQueue = (repair: Plan.Repair, view: PlaybackView, state: SessionState) =>
+        Effect.gen(function*() {
+          const label = trackLabel(repair.item.track)
+          const stats = planStats(state)
+          switch (repair._tag) {
+            case "Readd": {
+              const pushed = yield* Effect.result(api.addToQueue(repair.item.track.uri, view.device.id ?? undefined))
+              const ok = pushed._tag === "Success"
+              yield* Effect.logWarning(`${label} vanished from Spotify's queue; re-added (attempt ${repair.attempt}): ${ok ? "ok" : pushed.failure.message}`)
+              yield* events.publish({
+                type: "queue_repaired",
+                track: label,
+                uri: repair.item.track.uri,
+                detail: ok
+                  ? `Spotify dropped the locked-in track from its queue; dj added it again (attempt ${repair.attempt} of ${Plan.MAX_READDS})`
+                  : `Spotify dropped the locked-in track and re-adding failed: ${pushed.failure.message}`,
+                ...stats
+              })
+              return
+            }
+            case "PlayedUnseen":
+              yield* Effect.logInfo(`${label} left Spotify's queue while playback was hidden; counting it as played`)
+              return yield* events.publish({
+                type: "queue_repaired",
+                track: label,
+                uri: repair.item.track.uri,
+                detail: "Left Spotify's queue while Spotify was hiding playback (e.g. a private session); counted as played, staging the next track",
+                ...stats
+              })
+            case "GaveUp":
+              yield* Effect.logWarning(`${label} keeps vanishing from Spotify's queue; giving up after ${Plan.MAX_READDS} re-adds`)
+              return yield* events.publish({
+                type: "queue_repaired",
+                track: label,
+                uri: repair.item.track.uri,
+                detail: `Spotify kept dropping this track from its queue (${Plan.MAX_READDS} re-adds); dj skipped it and is staging the next plan track`,
+                ...stats
+              })
+          }
+        })
 
       const loop = Effect.gen(function*() {
         const delay = yield* tick.pipe(

@@ -198,7 +198,13 @@ export const StagedItem = Schema.Struct({
   item: PlanItem,
   staged_at: Schema.Number,
   /** Cancelled items can't be pulled out of Spotify's queue, so they get auto-skipped. */
-  cancelled: Schema.Boolean
+  cancelled: Schema.Boolean,
+  /** Consecutive queue checks that didn't find it in Spotify's queue. */
+  misses: Schema.optional(Schema.Number),
+  /** Times it was added to Spotify's queue again after the device dropped it. */
+  readds: Schema.optional(Schema.Number),
+  /** Spotify hid the current track at some point since staging (private session, some devices), so it may have played unseen. */
+  blind: Schema.optional(Schema.Boolean)
 })
 export type StagedItem = typeof StagedItem.Type
 
@@ -210,7 +216,9 @@ export const HistoryEntry = Schema.Struct({
   /** Who queued it, for tracks that came from the plan. */
   by: Schema.optional(Schema.String),
   /** Set when the listener moved on well before the track ended. */
-  skipped_after_ms: Schema.optional(Schema.Number)
+  skipped_after_ms: Schema.optional(Schema.Number),
+  /** It left Spotify's queue while Spotify was hiding playback, so dj counts it as played without having seen it. */
+  unseen: Schema.optional(Schema.Boolean)
 })
 export type HistoryEntry = typeof HistoryEntry.Type
 

@@ -632,6 +632,9 @@ export const VibeToolkitLayer: Layer.Layer<
           })
           const lockedIndex = spotifyQueue.findIndex((q) => q.from === "dj")
           const hints = [
+            ...(Option.isSome(pb) && Option.isNone(pb.value.track)
+              ? ["Spotify isn't reporting the current track (a private session, or a device that hides it). dj keeps the locked-in track queued but can't see what plays until it's visible again."]
+              : []),
             ...(drivenByOther && driver !== undefined
               ? [`${driver.name} is driving the plan. Don't change it unless the listener asked you to; coordinate with them on chirp, or pass take_over: true.`]
               : []),

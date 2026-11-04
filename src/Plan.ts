@@ -215,11 +215,76 @@ export const observeCurrent = (
   }
 }
 
-/** Drop staged items Spotify evidently lost (not in its queue anymore). */
-export const pruneStaged = (state: SessionState, spotifyQueue: ReadonlyArray<Track>): SessionState => ({
-  ...state,
-  staged: state.staged.filter((s) => spotifyQueue.some((q) => sameTrack(q, s.item.track)))
-})
+// ---------------------------------------------------------------------------
+// Queue reconciliation: Spotify devices can drop a track added over the API
+// (seen with the iOS app), so dj checks that its locked-in track is still in
+// Spotify's real queue and adds it again when it isn't. That never interrupts
+// what's playing.
+// ---------------------------------------------------------------------------
+
+/** Spotify needs a moment after an add before its queue endpoint shows it. */
+export const QUEUE_GRACE_MS = 20_000
+/** Absent this many checks in a row before dj believes it. */
+export const MISSES_TO_ACT = 2
+/** Give up re-adding after this many tries, so a device that keeps dropping it can't loop forever. */
+export const MAX_READDS = 5
+/** Spotify's queue endpoint returns about 20 tracks; past that, a missing track may just be further back. */
+export const QUEUE_PAGE = 20
+
+export type Repair =
+  | { readonly _tag: "Readd"; readonly item: PlanItem; readonly attempt: number }
+  | { readonly _tag: "PlayedUnseen"; readonly item: PlanItem }
+  | { readonly _tag: "GaveUp"; readonly item: PlanItem }
+
+/** Mark active staged items: Spotify just hid the current track, so they might play without dj seeing it. */
+export const markBlind = (state: SessionState): SessionState =>
+  state.staged.some((s) => !s.cancelled && s.blind !== true)
+    ? { ...state, staged: state.staged.map((s) => (s.cancelled || s.blind === true ? s : { ...s, blind: true })) }
+    : state
+
+/**
+ * Compare staged items with Spotify's real queue. Cancelled items that are gone are simply dropped.
+ * An active item missing {@link MISSES_TO_ACT} checks in a row is added again, or counted as played
+ * if Spotify was hiding playback meanwhile, or dropped after {@link MAX_READDS} tries.
+ */
+export const reconcileStaged = (
+  state: SessionState,
+  spotifyQueue: ReadonlyArray<Track>,
+  current: Track | undefined,
+  now: number
+): { readonly state: SessionState; readonly repairs: ReadonlyArray<Repair> } => {
+  const inQueue = (t: Track) => spotifyQueue.some((q) => sameTrack(q, t)) || (current !== undefined && sameTrack(current, t))
+  const truncated = spotifyQueue.length >= QUEUE_PAGE
+  const results = state.staged.map((s): { readonly keep: StagedItem | undefined; readonly repair?: Repair } => {
+    if (inQueue(s.item.track)) return { keep: s.misses ? { ...s, misses: 0 } : s }
+    if (s.cancelled) return { keep: undefined }
+    if (truncated || now - s.staged_at < QUEUE_GRACE_MS) return { keep: s }
+    const misses = (s.misses ?? 0) + 1
+    if (misses < MISSES_TO_ACT) return { keep: { ...s, misses } }
+    if (s.blind === true) return { keep: undefined, repair: { _tag: "PlayedUnseen", item: s.item } }
+    const readds = (s.readds ?? 0) + 1
+    if (readds > MAX_READDS) return { keep: undefined, repair: { _tag: "GaveUp", item: s.item } }
+    return { keep: { ...s, staged_at: now, misses: 0, readds }, repair: { _tag: "Readd", item: s.item, attempt: readds } }
+  })
+  const repairs = results.flatMap((r) => (r.repair === undefined ? [] : [r.repair]))
+  const unseen = repairs.flatMap((r): ReadonlyArray<HistoryEntry> =>
+    r._tag === "PlayedUnseen"
+      ? [{
+        track: r.item.track,
+        started_at: now,
+        source: "plan",
+        unseen: true,
+        ...(r.item.vibe !== undefined ? { vibe: r.item.vibe } : {}),
+        ...(r.item.by !== undefined ? { by: r.item.by } : {})
+      }]
+      : []
+  )
+  const staged = results.flatMap((r) => (r.keep === undefined ? [] : [r.keep]))
+  const unchanged = repairs.length === 0 && staged.length === state.staged.length && staged.every((s, i) => s === state.staged[i])
+  return unchanged
+    ? { state, repairs }
+    : { state: { ...state, staged, history: [...state.history, ...unseen].slice(-HISTORY_LIMIT) }, repairs }
+}
 
 export interface Timing {
   readonly maxSleepMs: number
@@ -235,8 +300,8 @@ export const defaultTiming: Timing = { maxSleepMs: 15_000 }
  */
 export const shouldStage = (
   state: SessionState,
-  playback: { readonly isPlaying: boolean; readonly remainingMs: number }
-): boolean => playback.isPlaying && activeStaged(state).length === 0 && state.plan.length > 0
+  playback: { readonly isPlaying: boolean; readonly remainingMs: number; readonly hidden?: boolean }
+): boolean => (playback.isPlaying || playback.hidden === true) && activeStaged(state).length === 0 && state.plan.length > 0
 
 /** How long the feeder should sleep before the next poll. */
 export const nextDelayMs = (

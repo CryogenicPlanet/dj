@@ -221,3 +221,88 @@ describe("driver lease", () => {
     expect(Plan.callerAgent("owner")).toBe("owner")
   })
 })
+
+describe("queue reconciliation", () => {
+  const T0 = 1_000
+  const later = (ms: number) => T0 + Plan.QUEUE_GRACE_MS + ms
+  const staged = (state: SessionState) => {
+    const r = Plan.stageHead(state, T0)
+    if (r === undefined) throw new Error("nothing to stage")
+    return r.state
+  }
+
+  test("a locked-in track still in Spotify's queue is left alone", () => {
+    const s = staged(withPlan(A, B))
+    const r = Plan.reconcileStaged(s, [A, C], undefined, later(0))
+    expect(r.repairs).toEqual([])
+    expect(r.state).toBe(s)
+  })
+
+  test("Spotify gets a grace period right after the add", () => {
+    const s = staged(withPlan(A, B))
+    expect(Plan.reconcileStaged(s, [C], undefined, T0 + 5_000).repairs).toEqual([])
+  })
+
+  test("one miss isn't enough; two in a row re-add it without touching the plan", () => {
+    const s = staged(withPlan(A, B))
+    const first = Plan.reconcileStaged(s, [C], undefined, later(0))
+    expect(first.repairs).toEqual([])
+    expect(first.state.staged[0]?.misses).toBe(1)
+    const second = Plan.reconcileStaged(first.state, [C], undefined, later(30_000))
+    expect(second.repairs.map((r) => r._tag)).toEqual(["Readd"])
+    expect(second.state.staged[0]).toMatchObject({ misses: 0, readds: 1, staged_at: later(30_000) })
+    expect(second.state.plan.map((p) => p.track.name)).toEqual(["B"])
+  })
+
+  test("a miss streak resets when the track shows up again", () => {
+    const s = staged(withPlan(A, B))
+    const first = Plan.reconcileStaged(s, [C], undefined, later(0))
+    const back = Plan.reconcileStaged(first.state, [A], undefined, later(30_000))
+    expect(back.state.staged[0]?.misses).toBe(0)
+    expect(back.repairs).toEqual([])
+  })
+
+  test("the currently playing track counts as present", () => {
+    const s = staged(withPlan(A, B))
+    const twice = Plan.reconcileStaged(Plan.reconcileStaged(s, [], A, later(0)).state, [], A, later(30_000))
+    expect(twice.repairs).toEqual([])
+  })
+
+  test("a truncated queue page proves nothing", () => {
+    const s = staged(withPlan(A, B))
+    const full = Array.from({ length: Plan.QUEUE_PAGE }, (_, i) => track(`X${i}`))
+    const r = Plan.reconcileStaged(Plan.reconcileStaged(s, full, undefined, later(0)).state, full, undefined, later(30_000))
+    expect(r.repairs).toEqual([])
+  })
+
+  test("if Spotify was hiding playback, a vanished track counts as played unseen", () => {
+    const s = Plan.markBlind(staged(withPlan(A, B)))
+    const r = Plan.reconcileStaged(Plan.reconcileStaged(s, [], undefined, later(0)).state, [], undefined, later(30_000))
+    expect(r.repairs.map((x) => x._tag)).toEqual(["PlayedUnseen"])
+    expect(Plan.activeStaged(r.state)).toEqual([])
+    expect(r.state.history.at(-1)).toMatchObject({ source: "plan", unseen: true })
+    expect(Plan.shouldStage(r.state, { isPlaying: false, remainingMs: 0, hidden: true })).toBe(true)
+  })
+
+  test("after MAX_READDS re-adds it gives up so the next track can stage", () => {
+    const missTwice = (st: SessionState, at: number) =>
+      Plan.reconcileStaged(Plan.reconcileStaged(st, [], undefined, at).state, [], undefined, at + Plan.QUEUE_GRACE_MS)
+    const start = staged(withPlan(A, B))
+    const exhausted = Array.from({ length: Plan.MAX_READDS }).reduce<SessionState>(
+      (st, _, i) => missTwice(st, later(i * 100_000)).state,
+      start
+    )
+    expect(exhausted.staged[0]?.readds).toBe(Plan.MAX_READDS)
+    const r = missTwice(exhausted, later(Plan.MAX_READDS * 100_000))
+    expect(r.repairs.map((x) => x._tag)).toEqual(["GaveUp"])
+    expect(Plan.activeStaged(r.state)).toEqual([])
+  })
+
+  test("cancelled tracks that left the queue are just forgotten", () => {
+    const s = staged(withPlan(A, B))
+    const cancelled = Plan.removeFromPlan(s, ["t1"]).state
+    const r = Plan.reconcileStaged(cancelled, [], undefined, later(0))
+    expect(r.state.staged).toEqual([])
+    expect(r.repairs).toEqual([])
+  })
+})
