@@ -107,7 +107,7 @@ Set these variables on the service:
 | `VIBEQ_HOST` | `::` to listen on IPv6 too (Railway's private network). Defaults to `0.0.0.0` |
 | `LASTFM_API_KEY`, `STATSFM_USER`, `VIBEQ_PROFILE_FILES`, `VIBEQ_HISTORY_DIR` | Optional taste sources, as above. Point the files at `/data` |
 
-Then open `https://dj.example.com/login` and sign in with Spotify to link your account.
+Then add `https://dj.example.com/callback` to your Spotify app's redirect URIs, open `https://dj.example.com/login`, and sign in with Spotify to link your account. The OAuth sign-in below uses the same redirect URI, so it needs to be registered even if you copied your login over from a local install.
 
 Note that `railway restart` keeps the old environment. After changing variables, run `railway redeploy`.
 
@@ -241,6 +241,7 @@ dj builds a personal music graph in `tracks.db` (SQLite):
 - **When the plan runs dry, Spotify's autoplay takes over.** That's deliberate: dj never picks tracks itself. Keep the agent listening for `plan_low`.
 - **`replace` keeps the locked-in track,** because new directions should flow out of it. Only `cancel_locked_in` or an `edit_plan` removal skips it, which costs about a one-second blip.
 - **Some devices drop queued tracks.** dj checks Spotify's queue about every 25 seconds and re-adds the locked-in track if it vanished.
+- **"INVALID_CLIENT: Invalid redirect URI" from Spotify** means the Spotify app doesn't list `<origin>/callback`. Add it in the dashboard. Spotify only checks this after you log in, so the error shows up mid-sign-in.
 - **Development-mode Spotify apps** allow 5 users and cap search at 10 results per request. Both are fine for personal use.
 
 ## Development
