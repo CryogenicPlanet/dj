@@ -1,11 +1,13 @@
-import { Effect, FileSystem, Option, Path, Stream } from "effect"
+import { Clock, Effect, FileSystem, Option, Path, Stream } from "effect"
 import { Tool } from "effect/ai"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { timingSafeEqual } from "node:crypto"
 import { AppConfig } from "./AppConfig.ts"
+import { CurrentCaller } from "./Caller.ts"
 import { Dj } from "./Dj.ts"
 import type { Track } from "./Domain.ts"
 import { SERVER_INSTRUCTIONS } from "./Instructions.ts"
+import * as Plan from "./Plan.ts"
 import { VibeToolkit } from "./Tools.ts"
 import { VIEW_HTML } from "./View.ts"
 
@@ -80,6 +82,7 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const locked = state.staged.filter((s) => !s.cancelled).map((s) => s.item)
       const current = Option.flatMap(pb, (p) => p.track)
       const currentVibe = state.history.at(-1)?.vibe ?? locked[0]?.vibe ?? state.plan[0]?.vibe
+      const driver = Plan.activeDriver(state, yield* Clock.currentTimeMillis)
       return HttpServerResponse.jsonUnsafe({
         playing: Option.match(pb, {
           onNone: () => null,
@@ -91,14 +94,17 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
           })
         }),
         vibe: currentVibe ?? null,
+        driver: driver === undefined ? null : { name: Plan.callerAgent(driver.name), since: driver.since },
         up_next: [...locked, ...state.plan].slice(0, 15).map((p) => ({
           ...publicTrack(p.track),
           ...(p.vibe !== undefined ? { vibe: p.vibe } : {}),
-          ...(p.note !== undefined ? { note: p.note } : {})
+          ...(p.note !== undefined ? { note: p.note } : {}),
+          ...(p.by !== undefined ? { queued_by: Plan.callerAgent(p.by) } : {})
         })),
         recent: state.history.slice(-12).toReversed().map((h) => ({
           ...publicTrack(h.track),
           by: h.source === "plan" ? "dj" : "spotify",
+          ...(h.by !== undefined ? { queued_by: Plan.callerAgent(h.by) } : {}),
           ...(h.vibe !== undefined ? { vibe: h.vibe } : {}),
           ...(h.skipped_after_ms !== undefined ? { skipped: true } : {})
         }))
@@ -159,13 +165,15 @@ ${SERVER_INSTRUCTIONS}
           return jsonError(403, `${name} changes playback or stored taste and needs write scope`)
         }
         const args = yield* request.json.pipe(Effect.orElseSucceed(() => ({})))
-        const caller = request.headers["x-chirp-caller"] ?? "operator"
+        // Proxied calls name the chirp agent; direct calls hold dj's secret, so they're the owner.
+        const caller = (request.headers["x-chirp-caller"] ?? "owner").slice(0, 200)
         yield* Effect.logInfo(`tool ${name} called by ${caller}`)
         // The name is checked against the toolkit above, and the toolkit decodes the untrusted arguments
         // against the tool's own parameter schema before any handler runs, so these casts only bridge
         // dynamic dispatch into the statically typed `handle`.
         const handled = yield* toolkit.handle(name as keyof typeof toolkit.tools, args as never).pipe(
           Effect.flatMap(Stream.runLast),
+          Effect.provideService(CurrentCaller, caller),
           Effect.result
         )
         if (handled._tag === "Failure") return jsonError(400, handled.failure.message)

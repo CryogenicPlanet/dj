@@ -187,7 +187,9 @@ export const PlanItem = Schema.Struct({
   track: Track,
   vibe: Schema.optional(Schema.String),
   note: Schema.optional(Schema.String),
-  added_at: Schema.Number
+  added_at: Schema.Number,
+  /** Who queued it: a chirp caller such as "instinct@cryo", or "owner" for direct calls. */
+  by: Schema.optional(Schema.String)
 })
 export type PlanItem = typeof PlanItem.Type
 
@@ -205,17 +207,31 @@ export const HistoryEntry = Schema.Struct({
   started_at: Schema.Number,
   source: Schema.Literals(["plan", "other"]),
   vibe: Schema.optional(Schema.String),
+  /** Who queued it, for tracks that came from the plan. */
+  by: Schema.optional(Schema.String),
   /** Set when the listener moved on well before the track ended. */
   skipped_after_ms: Schema.optional(Schema.Number)
 })
 export type HistoryEntry = typeof HistoryEntry.Type
+
+/**
+ * The agent steering the plan. A soft lease: it renews on every plan change and lapses on its own, so a crashed
+ * agent never wedges the music. Other agents' plan changes are refused while it holds, unless they take over.
+ */
+export const Driver = Schema.Struct({
+  name: Schema.String,
+  since: Schema.Number,
+  until: Schema.Number
+})
+export type Driver = typeof Driver.Type
 
 export const SessionState = Schema.Struct({
   plan: Schema.Array(PlanItem),
   staged: Schema.Array(StagedItem),
   history: Schema.Array(HistoryEntry),
   last_seen_uri: Schema.NullOr(Schema.String),
-  next_key: Schema.Number
+  next_key: Schema.Number,
+  driver: Schema.optional(Driver)
 })
 export type SessionState = typeof SessionState.Type
 

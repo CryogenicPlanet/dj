@@ -83,7 +83,7 @@ export const VIEW_HTML = `<!doctype html>
   const row = (t, i, extra) =>
     '<li class="' + (i === 0 ? "first" : "later") + '">' + art(t) +
     '<div><div class="t"><a href="' + esc(t.url) + '" style="color:inherit;text-decoration:none">' + esc(t.title) + '</a></div>' +
-    '<div class="a">' + esc(t.artists) + (t.vibe ? ' · ' + esc(t.vibe) : '') + '</div>' +
+    '<div class="a">' + esc(t.artists) + (t.vibe ? ' · ' + esc(t.vibe) : '') + (t.queued_by ? ' · by ' + esc(t.queued_by) : '') + '</div>' +
     (t.note ? '<div class="note">' + esc(t.note) + '</div>' : '') + '</div>' + (extra || '<span></span>') + '</li>';
 
   function tick() {
@@ -100,7 +100,8 @@ export const VIEW_HTML = `<!doctype html>
       const r = await fetch("/api/now", { cache: "no-store" });
       const d = await r.json();
       const p = d.playing, t = p && p.track;
-      $("status").textContent = p ? (p.is_playing ? "live · " + (p.device || "").toLowerCase() : "paused") : "nothing playing";
+      $("status").textContent = (p ? (p.is_playing ? "live · " + (p.device || "").toLowerCase() : "paused") : "nothing playing") +
+        (d.driver ? " · " + d.driver.name + " is driving" : "");
       $("state").textContent = p && !p.is_playing ? "paused" : "now playing";
       $("title").innerHTML = t ? '<a href="' + esc(t.url) + '">' + esc(t.title) + '</a>' : "—";
       $("artist").textContent = t ? t.artists : "";

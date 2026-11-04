@@ -213,14 +213,27 @@ graph TD
 - **Chirp forwards the caller.** It sends `x-chirp-caller` and `x-chirp-scopes` with each call. dj logs the caller and refuses tools that change things (`queue_songs`, `edit_plan`, `playback`, …) when the scopes lack `write`.
 - **Only the owner can log in.** `VIBEQ_OWNER_SPOTIFY_ID` stops anyone else's Spotify account from linking itself at `/login`.
 
+## Several agents
+
+When several agents can reach dj (for example through chirp), one drives at a time:
+
+- **Lease.** Every plan change gives its author a 20-minute **driver lease**, renewed by each further change.
+- **Refusals.** While the lease holds, `queue_songs`, `edit_plan` and `play_now` from other agents are refused with the driver's name. They succeed with `take_over: true`, which notifies the old driver through a `driver_changed` event.
+- **Always open.** Reads, events and playback controls stay open to everyone.
+- **Attribution.** Every plan item and history entry records who queued it. `now_playing` and the live view show it.
+
+A lease lapses on its own, so a crashed agent never leaves the music unsteered. Callers are named by chirp's `x-chirp-caller`. Direct callers holding dj's secret are `owner`.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `now_playing` | Playback, the locked-in track, the plan (with keys), recent history, hints ("plan running low") |
+| `now_playing` | Playback, who's driving, the locked-in track, the plan (with keys and who queued each), Spotify's own queue, recent history, hints |
 | `queue_songs` | Batch resolve and add. `position`: `end` / `next` / `replace`. Takes a `vibe` label. Auto-starts if idle |
 | `edit_plan` | Remove by key, move, clear, reset history |
 | `play_now` | Interrupt with one song; the plan continues afterwards |
+
+`queue_songs`, `edit_plan` and `play_now` all take `take_over`; see [Several agents](#several-agents).
 | `playback` | pause / resume / skip / previous / volume |
 | `devices` | List Spotify Connect devices and transfer playback |
 | `search_tracks` | Raw Spotify search (supports `track:` / `artist:` / `year:` / `genre:` filters) |

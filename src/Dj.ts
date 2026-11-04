@@ -1,6 +1,8 @@
 import { Clock, Context, Duration, Effect, FileSystem, Layer, Option, Queue, Ref, Schema, Semaphore } from "effect"
 import { AppConfig } from "./AppConfig.ts"
+import { CurrentCaller } from "./Caller.ts"
 import {
+  type Driver,
   emptySession,
   type PlanItem,
   SessionState,
@@ -30,6 +32,8 @@ export interface QueueOptions {
   readonly allowRepeats: boolean
   readonly startIfIdle: boolean
   readonly cancelLockedIn: boolean
+  /** Change the plan even though another agent is driving it. */
+  readonly takeOver: boolean
 }
 
 export interface QueueOutcome {
@@ -55,10 +59,10 @@ export class Dj extends Context.Service<Dj, {
   readonly state: Effect.Effect<SessionState>
   readonly playback: Effect.Effect<Option.Option<PlaybackView>, SpotifyFailure>
   readonly queueSongs: (options: QueueOptions) => Effect.Effect<QueueOutcome, DjFailure>
-  readonly playNow: (song: SongRequest, vibe: string | undefined) => Effect.Effect<Track, DjFailure>
-  readonly remove: (keys: ReadonlyArray<string>) => Effect.Effect<Plan.RemoveResult>
-  readonly move: (key: string, toIndex: number) => Effect.Effect<SessionState, DjError>
-  readonly clear: (resetHistory: boolean) => Effect.Effect<SessionState>
+  readonly playNow: (song: SongRequest, vibe: string | undefined, takeOver: boolean) => Effect.Effect<Track, DjFailure>
+  readonly remove: (keys: ReadonlyArray<string>, takeOver: boolean) => Effect.Effect<Plan.RemoveResult, DjError>
+  readonly move: (key: string, toIndex: number, takeOver: boolean) => Effect.Effect<SessionState, DjError>
+  readonly clear: (resetHistory: boolean, takeOver: boolean) => Effect.Effect<SessionState, DjError>
   readonly control: (action: ControlAction, volume: Option.Option<number>) => Effect.Effect<void, DjFailure>
   readonly startPlan: Effect.Effect<PlanItem, DjFailure>
 }>()("vibeq/Dj") {
@@ -143,6 +147,38 @@ export class Dj extends Context.Service<Dj, {
           })
         )
 
+      const drivingMessage = (driver: Driver, now: number) =>
+        `${driver.name} is driving the plan (for another ${Math.max(1, Math.ceil((driver.until - now) / 60_000))} min). ` +
+        "Leave their set alone, or coordinate with them on chirp. If the listener asked you to change it, call again with take_over: true."
+
+      /**
+       * A plan change by the current caller. Refused while another agent holds the driver lease, unless taking over.
+       * On success the caller holds (or renews) the lease, and a change of driver is announced as an event.
+       */
+      const steer = <A, E>(
+        takeOver: boolean,
+        f: (state: SessionState, by: string) => Effect.Effect<readonly [A, SessionState], E>
+      ) =>
+        Effect.gen(function*() {
+          const caller = yield* CurrentCaller
+          const now = yield* Clock.currentTimeMillis
+          const [result, previous, changed] = yield* transact<readonly [A, Driver | undefined, boolean], E | DjError>((state) => {
+            const holder = Plan.leaseConflict(state, caller, now)
+            if (holder !== undefined && !takeOver) return Effect.fail(new DjError({ message: drivingMessage(holder, now) }))
+            const previous = Plan.activeDriver(state, now)
+            const changed = previous === undefined || Plan.callerAgent(previous.name) !== Plan.callerAgent(caller)
+            return Effect.map(f(state, caller), ([a, next]) => [[a, previous, changed] as const, Plan.claimLease(next, caller, now)] as const)
+          })
+          if (changed) {
+            yield* events.publish({
+              type: "driver_changed",
+              detail: previous === undefined ? `${caller} is now driving the plan` : `${caller} took over the plan from ${previous.name}`,
+              ...planStats(yield* Ref.get(ref))
+            })
+          }
+          return result
+        })
+
       const toView = (p: SpPlaybackState): PlaybackView => {
         const track = p.item === null ? Option.none() : Option.some(toTrack(p.item))
         const progressMs = p.progress_ms ?? 0
@@ -203,7 +239,7 @@ export class Dj extends Context.Service<Dj, {
         const pb = options.startIfIdle ? yield* playback : Option.none<PlaybackView>()
         const idle = options.startIfIdle && (Option.isNone(pb) || !pb.value.isPlaying)
 
-        return yield* transact((state) =>
+        return yield* steer(options.takeOver, (state, by) =>
           Effect.gen(function*() {
             const resolved = resolutions.flatMap((r) => (r._tag === "Resolved" ? [r] : []))
             const unresolved = resolutions.flatMap((r) => (r._tag === "Unresolved" ? [r] : []))
@@ -219,7 +255,7 @@ export class Dj extends Context.Service<Dj, {
             )
             const { added, state: afterAdd } = Plan.addToPlan(
               state,
-              fresh.keep.map((r) => ({ track: r.track, vibe: options.vibe, note: r.request.note })),
+              fresh.keep.map((r) => ({ track: r.track, vibe: options.vibe, note: r.request.note, by })),
               options.position,
               now,
               { cancelLockedIn: options.cancelLockedIn }
@@ -252,16 +288,16 @@ export class Dj extends Context.Service<Dj, {
         )
       })
 
-      const playNow = Effect.fn("Dj.playNow")(function*(song: SongRequest, vibe: string | undefined) {
+      const playNow = Effect.fn("Dj.playNow")(function*(song: SongRequest, vibe: string | undefined, takeOver: boolean) {
         const resolution = yield* resolver.resolve(song)
         if (resolution._tag === "Unresolved") {
           const alts = resolution.candidates.map((c) => `${c.name} — ${c.artists.join(", ")} (${c.uri})`).join("; ")
           return yield* new DjError({ message: `${resolution.reason}${alts ? `: ${alts}` : ""}` })
         }
         const now = yield* Clock.currentTimeMillis
-        yield* transact((state) =>
+        yield* steer(takeOver, (state, by) =>
           Effect.gen(function*() {
-            const { state: next } = Plan.stageImmediate(state, { track: resolution.track, vibe, note: song.note }, now)
+            const { state: next } = Plan.stageImmediate(state, { track: resolution.track, vibe, note: song.note, by }, now)
             yield* playUri(resolution.track.uri)
             return [undefined, next] as const
           })
@@ -269,27 +305,25 @@ export class Dj extends Context.Service<Dj, {
         return resolution.track
       })
 
-      const pure = <A>(f: (s: SessionState) => readonly [A, SessionState]) => transact((s) => Effect.succeed(f(s)))
-
-      const remove = (keys: ReadonlyArray<string>) =>
-        pure((s) => {
+      const remove = (keys: ReadonlyArray<string>, takeOver: boolean) =>
+        steer(takeOver, (s) => {
           const r = Plan.removeFromPlan(s, keys)
-          return [r, r.state] as const
+          return Effect.succeed([r, r.state] as const)
         })
 
-      const move = (key: string, toIndex: number) =>
-        transact((s) => {
+      const move = (key: string, toIndex: number, takeOver: boolean) =>
+        steer(takeOver, (s) => {
           const next = Plan.moveInPlan(s, key, toIndex)
           return next === undefined
             ? Effect.fail(new DjError({ message: `No plan item with key ${key} (locked-in tracks can't be moved).` }))
             : Effect.succeed([next, next] as const)
         })
 
-      const clear = (resetHistory: boolean) =>
-        pure((s) => {
+      const clear = (resetHistory: boolean, takeOver: boolean) =>
+        steer(takeOver, (s) => {
           const cleared = Plan.clearPlan(s)
           const next = resetHistory ? { ...cleared, history: [] } : cleared
-          return [next, next] as const
+          return Effect.succeed([next, next] as const)
         })
 
       const control = Effect.fn("Dj.control")(function*(action: ControlAction, volume: Option.Option<number>) {

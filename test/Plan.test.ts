@@ -168,3 +168,56 @@ describe("skip detection", () => {
     expect(Plan.isSkip(150_000, 200_000)).toBe(false) // 75% in
   })
 })
+
+describe("attribution", () => {
+  test("who queued a track carries from the plan into history", () => {
+    const s = stage(Plan.addToPlan(emptySession, [{ track: A, by: "instinct@cryo" }], "end", 0).state)
+    expect(Plan.activeStaged(s)[0]?.item.by).toBe("instinct@cryo")
+    const { state, change } = Plan.observeCurrent(s, A, 10)
+    expect(change._tag).toBe("Started")
+    expect(state.history.at(-1)?.by).toBe("instinct@cryo")
+  })
+
+  test("tracks that didn't come from the plan have no author", () => {
+    const { state } = Plan.observeCurrent(emptySession, B, 10)
+    expect(state.history.at(-1)?.by).toBeUndefined()
+  })
+})
+
+describe("driver lease", () => {
+  const MIN = 60_000
+
+  test("the first plan change claims the lease", () => {
+    expect(Plan.leaseConflict(emptySession, "instinct@cryo", 0)).toBeUndefined()
+    const s = Plan.claimLease(emptySession, "instinct@cryo", 0)
+    expect(s.driver).toEqual({ name: "instinct@cryo", since: 0, until: Plan.LEASE_MS })
+  })
+
+  test("another agent conflicts while the lease holds", () => {
+    const s = Plan.claimLease(emptySession, "instinct@cryo", 0)
+    expect(Plan.leaseConflict(s, "claude@cryo", 5 * MIN)?.name).toBe("instinct@cryo")
+  })
+
+  test("the same agent on another surface is still the driver", () => {
+    const s = Plan.claimLease(emptySession, "instinct@cryo", 0)
+    expect(Plan.leaseConflict(s, "instinct@chatgpt", 5 * MIN)).toBeUndefined()
+  })
+
+  test("renewing keeps since and extends until", () => {
+    const s = Plan.claimLease(Plan.claimLease(emptySession, "instinct@cryo", 0), "instinct@cryo", 10 * MIN)
+    expect(s.driver).toEqual({ name: "instinct@cryo", since: 0, until: 10 * MIN + Plan.LEASE_MS })
+  })
+
+  test("an expired lease is free for anyone, and a new driver starts fresh", () => {
+    const s = Plan.claimLease(emptySession, "instinct@cryo", 0)
+    const later = Plan.LEASE_MS + 1
+    expect(Plan.activeDriver(s, later)).toBeUndefined()
+    expect(Plan.leaseConflict(s, "claude@cryo", later)).toBeUndefined()
+    expect(Plan.claimLease(s, "claude@cryo", later).driver?.since).toBe(later)
+  })
+
+  test("callerAgent strips the surface", () => {
+    expect(Plan.callerAgent("instinct@cryo")).toBe("instinct")
+    expect(Plan.callerAgent("owner")).toBe("owner")
+  })
+})

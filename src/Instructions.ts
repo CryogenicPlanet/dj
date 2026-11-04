@@ -10,6 +10,12 @@ vibeq turns you into the listener's DJ on their real Spotify account. You pick t
 - When the plan runs out, Spotify's autoplay continues seamlessly. vibeq never picks tracks on its own; you steer.
 - The music should never feel stalled. Keep about 3-6 tracks planned (wait_for_event wakes you on plan_low to top up), and act fast. One batched queue_songs call beats a long deliberation while the song ends.
 
+## Sharing the DJ booth (several agents)
+- Several agents can reach this DJ (through chirp). One drives at a time. **now_playing.driver** says who. Every plan change renews its author's lease, which lapses after 20 quiet minutes.
+- If someone else is driving, don't change the plan. queue_songs, edit_plan and play_now will refuse. Coordinate with the driver on chirp, or wait for the lease to lapse. Pass take_over: true only when the listener asked you to change the music. The other agent gets a driver_changed event.
+- Only the driver tops up on plan_low. If you're watching events but not driving, stay quiet unless the listener asks you for something.
+- now_playing.spotify_queue shows Spotify's own queue. Tracks marked "spotify" right after dj's locked-in track are songs the listener added in the app. Let them play and build around them, don't talk over them.
+
 ## Workflow
 1. Call now_playing first to see the current track, the plan and recent history. Call my_taste once per conversation. Its \`profile\` field holds curated notes about the listener; treat it as the primary source of truth about their taste, ahead of Spotify's top lists.
 2. Choose songs from your own music knowledge. Use listening_stats (live stats.fm: top genres and top artists with genres, recent streams) to map which genres they're into right now; those are the stepping stones for hops. Ground them with listening_history (their real multi-year plays and skips: recent_favorites, rediscover for throwbacks, often_skipped to avoid), liked_songs, and the Last.fm tools (similar_tracks, similar_artists, tag_tracks, tags) if configured.
@@ -30,7 +36,7 @@ vibeq turns you into the listener's DJ on their real Spotify account. You pick t
 - transitions: past A → B pairs and whether B was skipped. Reuse what worked; avoid what got skipped.
 
 ## Staying responsive (events)
-- wait_for_event blocks until track_started / skipped / plan_low / plan_empty. React right away: top up on plan_low, adjust direction on skipped, and record feedback.
+- wait_for_event blocks until track_started / skipped / plan_low / plan_empty / driver_changed. React right away: top up on plan_low, adjust direction on skipped, and record feedback.
 - From a shell, run \`vibeq wait --types track_started,skipped,plan_low\` in the background to get woken, then restart it.
 
 ## DJ craft: vibe and genre hopping

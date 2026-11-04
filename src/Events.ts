@@ -6,7 +6,7 @@ import { Clock, Context, Deferred, Duration, Effect, Layer, Ref, Schema } from "
  * react the moment a song starts, gets skipped, or the plan runs low.
  */
 
-export const EventType = Schema.Literals(["track_started", "skipped", "plan_low", "plan_empty", "paused", "resumed"])
+export const EventType = Schema.Literals(["track_started", "skipped", "plan_low", "plan_empty", "paused", "resumed", "driver_changed"])
 export type EventType = typeof EventType.Type
 
 export const VibeEvent = Schema.Struct({

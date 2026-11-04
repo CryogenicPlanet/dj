@@ -6,10 +6,10 @@
  * next track into Spotify's real queue shortly before the current track
  * ends. If a staged track gets cancelled, we auto-skip it when it starts.
  */
-import type { HistoryEntry, PlanItem, SessionState, StagedItem, Track } from "./Domain.ts"
+import type { Driver, HistoryEntry, PlanItem, SessionState, StagedItem, Track } from "./Domain.ts"
 import { normalize as normalizeForMatch } from "./Text.ts"
 
-export type { HistoryEntry, PlanItem, SessionState, StagedItem, Track }
+export type { Driver, HistoryEntry, PlanItem, SessionState, StagedItem, Track }
 
 export type Position = "end" | "next" | "replace"
 
@@ -24,11 +24,13 @@ export interface NewItem {
   readonly track: Track
   readonly vibe?: string | undefined
   readonly note?: string | undefined
+  readonly by?: string | undefined
 }
 
-const withOptional = (vibe: string | undefined, note: string | undefined) => ({
-  ...(vibe !== undefined ? { vibe } : {}),
-  ...(note !== undefined ? { note } : {})
+const withOptional = (item: NewItem) => ({
+  ...(item.vibe !== undefined ? { vibe: item.vibe } : {}),
+  ...(item.note !== undefined ? { note: item.note } : {}),
+  ...(item.by !== undefined ? { by: item.by } : {})
 })
 
 /** Same recording? URIs can differ due to track relinking, so fall back to name + lead artist. */
@@ -64,7 +66,7 @@ export const addToPlan = (
     key: `t${state.next_key + i}`,
     track: item.track,
     added_at: now,
-    ...withOptional(item.vibe, item.note)
+    ...withOptional(item)
   }))
   const next_key = state.next_key + items.length
   switch (position) {
@@ -120,7 +122,7 @@ export const stageImmediate = (state: SessionState, item: NewItem, now: number):
     key: `t${state.next_key}`,
     track: item.track,
     added_at: now,
-    ...withOptional(item.vibe, item.note)
+    ...withOptional(item)
   }
   return {
     item: planItem,
@@ -197,7 +199,8 @@ export const observeCurrent = (
     track: current,
     started_at: now,
     source: match === undefined ? "other" : "plan",
-    ...(match?.item.vibe !== undefined ? { vibe: match.item.vibe } : {})
+    ...(match?.item.vibe !== undefined ? { vibe: match.item.vibe } : {}),
+    ...(match?.item.by !== undefined ? { by: match.item.by } : {})
   }
   // Conservative: pauses inflate elapsed time, so a paused track never looks skipped.
   const last = base.history.at(-1)
@@ -247,4 +250,30 @@ export const nextDelayMs = (
   const hasCancelled = state.staged.some((s) => s.cancelled)
   // Poll right after the boundary so cancelled tracks get skipped fast and history stays accurate.
   return Math.max(hasCancelled ? 750 : 2_000, Math.min(playback.remainingMs + (hasCancelled ? 300 : 1_500), timing.maxSleepMs))
+}
+
+// ---------------------------------------------------------------------------
+// Driver lease: one agent steers the plan at a time.
+// ---------------------------------------------------------------------------
+
+/** How long a plan change keeps its author in charge. */
+export const LEASE_MS = 20 * 60_000
+
+/** "instinct@cryo" → "instinct": one agent reached through two surfaces is still one driver. */
+export const callerAgent = (caller: string): string => caller.split("@")[0] || caller
+
+export const activeDriver = (state: SessionState, now: number): Driver | undefined =>
+  state.driver !== undefined && state.driver.until > now ? state.driver : undefined
+
+/** The driver standing in `caller`'s way, if another agent holds an unexpired lease. */
+export const leaseConflict = (state: SessionState, caller: string, now: number): Driver | undefined => {
+  const driver = activeDriver(state, now)
+  return driver !== undefined && callerAgent(driver.name) !== callerAgent(caller) ? driver : undefined
+}
+
+/** Give `caller` the lease (or renew it), keeping `since` when the same agent keeps driving. */
+export const claimLease = (state: SessionState, caller: string, now: number): SessionState => {
+  const driver = activeDriver(state, now)
+  const continuing = driver !== undefined && callerAgent(driver.name) === callerAgent(caller)
+  return { ...state, driver: { name: caller, since: continuing ? driver.since : now, until: now + LEASE_MS } }
 }

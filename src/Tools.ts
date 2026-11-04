@@ -1,11 +1,13 @@
-import { Duration, Effect, Layer, Option, Random, Schema, SchemaGetter } from "effect"
+import { Clock, Duration, Effect, Layer, Option, Random, Schema, SchemaGetter } from "effect"
 import { Tool, Toolkit } from "effect/ai"
+import { CurrentCaller } from "./Caller.ts"
 import { Dj } from "./Dj.ts"
 import { type FeedbackEntry, Sentiment, type SpTrack, type Track, toTrack, trackLabel } from "./Domain.ts"
 import { Feedback } from "./Feedback.ts"
 import { History, statsLabel } from "./History.ts"
 import { Profile } from "./Profile.ts"
 import { LastFm, type SongRef } from "./LastFm.ts"
+import * as Plan from "./Plan.ts"
 import type { PlanItem } from "./Plan.ts"
 import { SongRequest } from "./Resolver.ts"
 import { SpotifyApi, type TimeRange } from "./SpotifyApi.ts"
@@ -46,6 +48,7 @@ const TrackOut = Schema.Struct({
   uri: Schema.String,
   vibe: Schema.optional(Schema.String),
   note: Schema.optional(Schema.String),
+  by: Schema.optional(Schema.String).annotate({ description: "Who queued it (a chirp agent, or 'owner')" }),
   you: Schema.optional(Schema.String).annotate({
     description: "The listener's relationship with this track: tier (L1 current rotation / L2 core / L3 archive), Liked, play history — or 'new to you'"
   }),
@@ -72,7 +75,10 @@ const mmss = (ms: number): string => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`
 }
 
-const trackOut = (track: Track, extra: { readonly key?: string; readonly vibe?: string | undefined; readonly note?: string | undefined } = {}): TrackOut => ({
+const trackOut = (
+  track: Track,
+  extra: { readonly key?: string; readonly vibe?: string | undefined; readonly note?: string | undefined; readonly by?: string | undefined } = {}
+): TrackOut => ({
   title: track.name,
   artists: track.artists.join(", "),
   length: mmss(track.duration_ms),
@@ -81,10 +87,11 @@ const trackOut = (track: Track, extra: { readonly key?: string; readonly vibe?: 
   ...(track.year !== undefined ? { year: track.year } : {}),
   ...(extra.key !== undefined ? { key: extra.key } : {}),
   ...(extra.vibe !== undefined ? { vibe: extra.vibe } : {}),
-  ...(extra.note !== undefined ? { note: extra.note } : {})
+  ...(extra.note !== undefined ? { note: extra.note } : {}),
+  ...(extra.by !== undefined ? { by: extra.by } : {})
 })
 
-const planOut = (item: PlanItem): TrackOut => trackOut(item.track, { key: item.key, vibe: item.vibe, note: item.note })
+const planOut = (item: PlanItem): TrackOut => trackOut(item.track, { key: item.key, vibe: item.vibe, note: item.note, by: item.by })
 
 const feedbackOut = (entry: FeedbackEntry) => ({
   sentiment: entry.sentiment,
@@ -103,7 +110,8 @@ const clampInt = (n: number, min: number, max: number) => Math.max(min, Math.min
 
 const NowPlaying = Tool.make("now_playing", {
   description:
-    "Current playback, the track locked in next, the upcoming plan (with keys), recent history and hints. Call this before planning.",
+    "Current playback, who is driving the plan, the track locked in next, the upcoming plan (with keys and who queued each), " +
+    "what is in Spotify's own queue, recent history and hints. Call this before planning.",
   parameters: Schema.Struct({
     plan_limit: withDefault(Schema.Int, 12, "How many upcoming plan items to show")
   }),
@@ -115,11 +123,34 @@ const NowPlaying = Tool.make("now_playing", {
       position: Schema.String,
       remaining_seconds: Schema.Number
     })),
+    driver: Schema.NullOr(Schema.Struct({
+      name: Schema.String,
+      you: Schema.Boolean,
+      minutes_left: Schema.Number,
+      driving_since: Schema.String
+    })).annotate({
+      description: "The agent steering the plan. While someone else drives, plan changes are refused unless you pass take_over"
+    }),
     locked_in: Schema.Array(TrackOut),
     up_next: Schema.Array(TrackOut),
     plan_length: Schema.Number,
     plan_minutes: Schema.Number,
-    recently_played: Schema.Array(Schema.Struct({ track: Schema.String, source: Schema.String, vibe: Schema.optional(Schema.String) })),
+    spotify_queue: Schema.Array(Schema.Struct({
+      title: Schema.String,
+      artists: Schema.String,
+      uri: Schema.String,
+      from: Schema.Literals(["dj", "dj (cancelled, will be skipped)", "spotify"])
+    })).annotate({
+      description:
+        "Spotify's own queue, next first (up to 10). 'dj' is the locked-in track. 'spotify' is anything else: songs the listener " +
+        "added in the app (these come right after dj's track) and then whatever the playing album, playlist or autoplay has next. Plan around the listener's adds"
+    }),
+    recently_played: Schema.Array(Schema.Struct({
+      track: Schema.String,
+      source: Schema.String,
+      vibe: Schema.optional(Schema.String),
+      by: Schema.optional(Schema.String)
+    })),
     hints: Schema.Array(Schema.String)
   }),
   failure: ToolError
@@ -143,6 +174,11 @@ const QueueSongs = Tool.make("queue_songs", {
       Schema.Boolean,
       false,
       "Only with replace: also auto-skip the locked-in track. Use only when the listener wants it gone (they hate it / asked to stop it), never just to change direction"
+    ),
+    take_over: withDefault(
+      Schema.Boolean,
+      false,
+      "Change the plan even though another agent is driving it (see now_playing.driver). Only when the listener asked you to; otherwise coordinate with the driver"
     )
   }),
   success: Schema.Struct({
@@ -173,7 +209,15 @@ const SearchTracks = Tool.make("search_tracks", {
 
 const PlayNow = Tool.make("play_now", {
   description: "Interrupt and play one specific song immediately. The plan continues afterwards.",
-  parameters: Schema.Struct({ song: SongRequest, vibe: Schema.optional(Schema.String) }),
+  parameters: Schema.Struct({
+    song: SongRequest,
+    vibe: Schema.optional(Schema.String),
+    take_over: withDefault(
+      Schema.Boolean,
+      false,
+      "Change the plan even though another agent is driving it (see now_playing.driver). Only when the listener asked you to; otherwise coordinate with the driver"
+    )
+  }),
   success: Schema.Struct({ playing: TrackOut }),
   failure: ToolError
 })
@@ -188,7 +232,12 @@ const EditPlan = Tool.make("edit_plan", {
       to_index: Schema.Int.annotate({ description: "0 = next up" })
     })),
     clear: withDefault(Schema.Boolean, false, "Remove every upcoming track"),
-    reset_history: withDefault(Schema.Boolean, false, "Also forget this session's history (re-allows repeats)")
+    reset_history: withDefault(Schema.Boolean, false, "Also forget this session's history (re-allows repeats)"),
+    take_over: withDefault(
+      Schema.Boolean,
+      false,
+      "Change the plan even though another agent is driving it (see now_playing.driver). Only when the listener asked you to; otherwise coordinate with the driver"
+    )
   }),
   success: Schema.Struct({
     removed: Schema.Array(TrackOut),
@@ -552,7 +601,7 @@ export const VibeToolkitLayer: Layer.Layer<
         })
       })
     const describePlan = (items: ReadonlyArray<PlanItem>) =>
-      describe(items.map((p) => ({ track: p.track, extra: { key: p.key, vibe: p.vibe, note: p.note } })))
+      describe(items.map((p) => ({ track: p.track, extra: { key: p.key, vibe: p.vibe, note: p.note, by: p.by } })))
     const describeTracks = (tracks: ReadonlyArray<Track>) => describe(tracks.map((track) => ({ track })))
 
     const planView = Effect.map(dj.state, (s) => ({
@@ -565,9 +614,30 @@ export const VibeToolkitLayer: Layer.Layer<
         Effect.gen(function*() {
           const pb = yield* dj.playback
           const state = yield* dj.state
+          const caller = yield* CurrentCaller
+          const now = yield* Clock.currentTimeMillis
           const locked = state.staged.filter((s) => !s.cancelled)
           const planMs = state.plan.reduce((sum, p) => sum + p.track.duration_ms, 0)
+          const driver = Plan.activeDriver(state, now)
+          const drivenByOther = driver !== undefined && Plan.callerAgent(driver.name) !== Plan.callerAgent(caller)
+          // Spotify's queue is best-effort: a failed read just leaves it out.
+          const queue = Option.isNone(pb) ? [] : yield* api.queue.pipe(
+            Effect.map((q) => q.queue.slice(0, 10).map(toTrack)),
+            Effect.orElseSucceed((): ReadonlyArray<Track> => [])
+          )
+          const spotifyQueue = queue.map((t) => {
+            const staged = state.staged.find((s) => Plan.sameTrack(s.item.track, t))
+            const from = staged === undefined ? "spotify" as const : staged.cancelled ? "dj (cancelled, will be skipped)" as const : "dj" as const
+            return { title: t.name, artists: t.artists.join(", "), uri: t.uri, from }
+          })
+          const lockedIndex = spotifyQueue.findIndex((q) => q.from === "dj")
           const hints = [
+            ...(drivenByOther && driver !== undefined
+              ? [`${driver.name} is driving the plan. Don't change it unless the listener asked you to; coordinate with them on chirp, or pass take_over: true.`]
+              : []),
+            ...(lockedIndex > 0
+              ? [`${lockedIndex} track(s) in Spotify's queue play before dj's locked-in track; the listener probably added them in the app.`]
+              : []),
             ...(Option.isNone(pb) ? ["Nothing is playing and no device is active. queue_songs will start playback (Spotify must be open on some device)."] : []),
             ...(state.plan.length === 0 ? ["The plan is empty — Spotify autoplay will take over after the current/locked-in track. Queue more songs."] : []),
             ...(state.plan.length > 0 && state.plan.length < 4 ? [`Only ${state.plan.length} track(s) left in the plan (~${Math.round(planMs / 60000)} min). Top it up.`] : []),
@@ -584,20 +654,28 @@ export const VibeToolkitLayer: Layer.Layer<
                 remaining_seconds: Math.round(p.remainingMs / 1000)
               })
             }),
+            driver: driver === undefined ? null : {
+              name: driver.name,
+              you: !drivenByOther,
+              minutes_left: Math.max(1, Math.ceil((driver.until - now) / 60_000)),
+              driving_since: new Date(driver.since).toISOString().slice(0, 16).replace("T", " ") + "Z"
+            },
             locked_in: locked.map((s) => planOut(s.item)),
             up_next: state.plan.slice(0, clampInt(plan_limit, 0, 100)).map(planOut),
             plan_length: state.plan.length,
             plan_minutes: Math.round(planMs / 60000),
+            spotify_queue: spotifyQueue,
             recently_played: state.history.slice(-8).toReversed().map((h) => ({
               track: trackLabel(h.track),
               source: h.source === "plan" ? "vibeq" : "spotify/manual",
-              ...(h.vibe !== undefined ? { vibe: h.vibe } : {})
+              ...(h.vibe !== undefined ? { vibe: h.vibe } : {}),
+              ...(h.by !== undefined ? { by: h.by } : {})
             })),
             hints
           }
         }).pipe(Effect.mapError(toToolError)),
 
-      queue_songs: ({ songs, position, vibe, allow_repeats, start_if_idle, cancel_locked_in }) =>
+      queue_songs: ({ songs, position, vibe, allow_repeats, start_if_idle, cancel_locked_in, take_over }) =>
         Effect.gen(function*() {
           if (songs.length === 0) return yield* new ToolError({ message: "songs must not be empty" })
           const outcome = yield* dj.queueSongs({
@@ -606,7 +684,8 @@ export const VibeToolkitLayer: Layer.Layer<
             vibe,
             allowRepeats: allow_repeats,
             startIfIdle: start_if_idle,
-            cancelLockedIn: cancel_locked_in
+            cancelLockedIn: cancel_locked_in,
+            takeOver: take_over
           })
           const state = yield* dj.state
           const started = Option.getOrNull(Option.map(outcome.started, planOut))
@@ -646,8 +725,8 @@ export const VibeToolkitLayer: Layer.Layer<
           Effect.mapError(toToolError)
         ),
 
-      play_now: ({ song, vibe }) =>
-        dj.playNow(song, vibe).pipe(
+      play_now: ({ song, vibe, take_over }) =>
+        dj.playNow(song, vibe, take_over).pipe(
           Effect.map((t) => ({ playing: trackOut(t) })),
           Effect.mapError(toToolError)
         ),
@@ -655,10 +734,10 @@ export const VibeToolkitLayer: Layer.Layer<
       edit_plan: (params) =>
         Effect.gen(function*() {
           const removal = params.remove !== undefined && params.remove.length > 0
-            ? yield* dj.remove(params.remove)
+            ? yield* dj.remove(params.remove, params.take_over)
             : undefined
-          if (params.move !== undefined) yield* dj.move(params.move.key, params.move.to_index)
-          if (params.clear || params.reset_history) yield* dj.clear(params.reset_history)
+          if (params.move !== undefined) yield* dj.move(params.move.key, params.move.to_index, params.take_over)
+          if (params.clear || params.reset_history) yield* dj.clear(params.reset_history, params.take_over)
           const view = yield* planView
           return {
             removed: (removal?.removed ?? []).map(planOut),
