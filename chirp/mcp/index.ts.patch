@@ -1,0 +1,18 @@
+Changes to chirp's app/ext/mcp/index.ts (applied 2026-11-03 against version 29628f3a):
+
+0. app/ext/dj.ts (repo: chirp/dj.ts) is a separate extension for the board API routes; it imports the proxy from ./mcp/dj.ts.
+
+1. Import, next to the editing import:
+     import { callDj, djNames, djTools } from "./dj.ts";
+
+2. Append to `instructions`:
+     " Music: dj_guide and dj steer Rahul's Spotify through his DJ (dj.cryo.wtf); call dj_guide first."
+
+3. Advertise the tools:
+     const tools: ReadonlyArray<
+       (typeof boardTools)[number] | (typeof editingTools)[number] | (typeof djTools)[number]
+     > = Object.freeze([...boardTools, ...editingTools, ...djTools]);
+
+4. In runTool, right after `const surface = yield* surfaceOf(...)`:
+     // dj tools proxy to Rahul's Spotify DJ; they reach no board state, so they skip the board handlers.
+     if (djNames.includes(call.value.name)) return yield* callDj(api.effects, ctx.db, { ...caller, surface }, call.value);

@@ -1,0 +1,27 @@
+{
+  "name": "vibeq",
+  "version": "0.1.0",
+  "description": "Agent-driven Spotify DJ: an MCP server + daemon that lets an AI agent plan and drip-feed your Spotify queue",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "vibeq": "./src/main.ts"
+  },
+  "scripts": {
+    "vibeq": "bun src/main.ts",
+    "serve": "bun src/main.ts serve",
+    "typecheck": "tsgo --noEmit -p .",
+    "lint": "oxlint src test",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run lint && bun test"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "4.1.2",
+    "effect": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "oxlint": "^1.90.0"
+  }
+}
