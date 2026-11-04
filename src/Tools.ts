@@ -625,11 +625,12 @@ export const VibeToolkitLayer: Layer.Layer<
             Effect.map((q) => q.queue.slice(0, 10).map(toTrack)),
             Effect.orElseSucceed((): ReadonlyArray<Track> => [])
           )
-          const spotifyQueue = queue.map((t) => {
-            const staged = state.staged.find((s) => Plan.sameTrack(s.item.track, t))
-            const from = staged === undefined ? "spotify" as const : staged.cancelled ? "dj (cancelled, will be skipped)" as const : "dj" as const
-            return { title: t.name, artists: t.artists.join(", "), uri: t.uri, from }
-          })
+          const spotifyQueue = queue.map((t) => ({
+            title: t.name,
+            artists: t.artists.join(", "),
+            uri: t.uri,
+            from: Plan.queueSource(state, t)
+          }))
           const lockedIndex = spotifyQueue.findIndex((q) => q.from === "dj")
           const hints = [
             ...(Option.isSome(pb) && Option.isNone(pb.value.track)

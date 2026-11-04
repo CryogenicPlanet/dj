@@ -194,7 +194,7 @@ When several agents can reach dj, one drives at a time:
 - **Lease.** Every plan change gives its author a 20-minute driver lease, renewed by each further change.
 - **Refusals.** While the lease holds, `queue_songs`, `edit_plan`, and `play_now` from other agents are refused with the driver's name. They succeed with `take_over: true`, which notifies the old driver through a `driver_changed` event.
 - **Always open.** Reads, events, and playback controls stay open to everyone.
-- **Attribution.** Every plan item and history entry records who queued it.
+- **Attribution.** Every plan item and history entry records who queued it. `now_playing` and the live page also show Spotify's own queue, marking each track `dj` or `spotify` (added in the app, the playing album or playlist, or autoplay).
 
 A lease lapses on its own, so a crashed agent never leaves the music unsteered. Callers are named by their OAuth app, by chirp's `x-chirp-caller`, or `owner` for dj's secret.
 

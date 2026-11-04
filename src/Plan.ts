@@ -340,3 +340,11 @@ export const claimLease = (state: SessionState, caller: string, now: number): Se
   const continuing = driver !== undefined && callerAgent(driver.name) === callerAgent(caller)
   return { ...state, driver: { name: caller, since: continuing ? driver.since : now, until: now + LEASE_MS } }
 }
+
+/** Where a track in Spotify's own queue came from. Anything dj didn't stage reads "spotify": added in the app, the playing album or playlist, or autoplay. */
+export type QueueSource = "dj" | "dj (cancelled, will be skipped)" | "spotify"
+
+export const queueSource = (state: SessionState, track: Track): QueueSource => {
+  const staged = state.staged.find((s) => sameTrack(s.item.track, track))
+  return staged === undefined ? "spotify" : staged.cancelled ? "dj (cancelled, will be skipped)" : "dj"
+}

@@ -1,11 +1,12 @@
-import { Clock, Effect, FileSystem, Option, Path, Stream } from "effect"
+import { Clock, Effect, FileSystem, Option, Path, Ref, Stream } from "effect"
 import { Tool } from "effect/ai"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { AppConfig } from "./AppConfig.ts"
 import { CurrentCaller, READ_ONLY_TOOLS } from "./Caller.ts"
 import { bearerOf, callerName, McpOAuth, secretMatches } from "./OAuth.ts"
 import { Dj } from "./Dj.ts"
-import type { Track } from "./Domain.ts"
+import { type Track, toTrack } from "./Domain.ts"
+import { SpotifyApi } from "./SpotifyApi.ts"
 import { SERVER_INSTRUCTIONS } from "./Instructions.ts"
 import * as Plan from "./Plan.ts"
 import { VibeToolkit } from "./Tools.ts"
@@ -48,6 +49,23 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
   const toolkit = yield* VibeToolkit
+  const api = yield* SpotifyApi
+
+  // Every viewer polls /api/now every few seconds, so Spotify's queue is read at most every 15s.
+  const QUEUE_CACHE_MS = 15_000
+  const queueCache = yield* Ref.make<{ readonly at: number; readonly tracks: ReadonlyArray<Track> }>({ at: 0, tracks: [] })
+  const spotifyQueue = Effect.gen(function*() {
+    const now = yield* Clock.currentTimeMillis
+    const cached = yield* Ref.get(queueCache)
+    if (now - cached.at < QUEUE_CACHE_MS) return cached.tracks
+    // Best-effort: a failed read shows nothing rather than failing the page.
+    const tracks = yield* api.queue.pipe(
+      Effect.map((q) => q.queue.slice(0, 10).map(toTrack)),
+      Effect.orElseSucceed((): ReadonlyArray<Track> => [])
+    )
+    yield* Ref.set(queueCache, { at: now, tracks })
+    return tracks
+  })
 
   const oauth = yield* McpOAuth
 
@@ -92,6 +110,7 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const current = Option.flatMap(pb, (p) => p.track)
       const currentVibe = state.history.at(-1)?.vibe ?? locked[0]?.vibe ?? state.plan[0]?.vibe
       const driver = Plan.activeDriver(state, yield* Clock.currentTimeMillis)
+      const queue = Option.isNone(pb) ? [] : yield* spotifyQueue
       return HttpServerResponse.jsonUnsafe({
         playing: Option.match(pb, {
           onNone: () => null,
@@ -110,6 +129,7 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
           ...(p.note !== undefined ? { note: p.note } : {}),
           ...(p.by !== undefined ? { queued_by: Plan.callerAgent(p.by) } : {})
         })),
+        spotify_queue: queue.map((t) => ({ ...publicTrack(t), from: Plan.queueSource(state, t) })),
         recent: state.history.slice(-12).toReversed().map((h) => ({
           ...publicTrack(h.track),
           by: h.source === "plan" ? "dj" : "spotify",

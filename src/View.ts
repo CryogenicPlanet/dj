@@ -44,7 +44,10 @@ export const VIEW_HTML = `<!doctype html>
   .tag.dj { color: var(--accent); }
   li > div { min-width: 0; }
   .first { opacity: 1; } .later { opacity: .82; }
-  .empty { color: var(--muted); padding: 12px 0; border-top: 1px solid var(--faint); }
+  .later-h { margin-top: 28px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .tag.cancel { color: var(--skip); }
+  li.empty { display: block; color: var(--muted); padding: 12px 0; border-top: 1px solid var(--faint); }
   footer { margin-top: 48px; color: var(--muted); font-size: 12px; }
   footer a { color: inherit; }
   @media (max-width: 720px) {
@@ -68,7 +71,11 @@ export const VIEW_HTML = `<!doctype html>
     </div>
   </section>
   <section class="cols">
-    <div><h2>Up next · the DJ's plan</h2><ol id="next"></ol></div>
+    <div>
+      <h2>Up next · the DJ's plan</h2><ol id="next"></ol>
+      <h2 class="later-h">Spotify's queue</h2><ol id="spq"></ol>
+      <p class="hint"><span class="tag">spotify</span> means dj didn't add it: queued in the app, the playing album or playlist, or autoplay.</p>
+    </div>
     <div><h2>Recently played</h2><ol id="recent"></ol></div>
   </section>
   <footer>A live queue curated by an AI DJ for Rahul. Agents: <a href="/init">/init</a>.</footer>
@@ -113,6 +120,11 @@ export const VIEW_HTML = `<!doctype html>
       $("next").innerHTML = d.up_next.length
         ? d.up_next.map((x, i) => row(x, i, i === 0 ? '<span class="tag dj">next</span>' : '')).join("")
         : '<li class="empty">Nothing planned. Spotify autoplay is driving.</li>';
+      const spq = d.spotify_queue || [];
+      $("spq").innerHTML = spq.length
+        ? spq.map((x, i) => row(x, i, x.from === "dj" ? '<span class="tag dj">dj</span>'
+            : x.from === "spotify" ? '<span class="tag">spotify</span>' : '<span class="tag cancel">dj · will skip</span>')).join("")
+        : '<li class="empty">' + (p ? "Spotify's queue is empty." : "Nothing playing.") + '</li>';
       $("recent").innerHTML = d.recent.length
         ? d.recent.map((x, i) => row(x, i, x.skipped ? '<span class="tag skip">skipped</span>' : '<span class="tag ' + (x.by === "dj" ? "dj" : "") + '">' + x.by + '</span>')).join("")
         : '<li class="empty">No history yet.</li>';

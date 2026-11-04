@@ -306,3 +306,13 @@ describe("queue reconciliation", () => {
     expect(r.repairs).toEqual([])
   })
 })
+
+describe("queueSource", () => {
+  test("labels dj's locked-in track, a cancelled one, and everything else", () => {
+    const s = stage(withPlan(A, B))
+    expect(Plan.queueSource(s, A)).toBe("dj")
+    expect(Plan.queueSource(s, D)).toBe("spotify")
+    const cancelled = Plan.addToPlan(s, [{ track: C }], "replace", 0, { cancelLockedIn: true }).state
+    expect(Plan.queueSource(cancelled, A)).toBe("dj (cancelled, will be skipped)")
+  })
+})
