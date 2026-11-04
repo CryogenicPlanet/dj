@@ -228,9 +228,6 @@ export const QUEUE_GRACE_MS = 20_000
 export const MISSES_TO_ACT = 2
 /** Give up re-adding after this many tries, so a device that keeps dropping it can't loop forever. */
 export const MAX_READDS = 5
-/** Spotify's queue endpoint returns about 20 tracks; past that, a missing track may just be further back. */
-export const QUEUE_PAGE = 20
-
 export type Repair =
   | { readonly _tag: "Readd"; readonly item: PlanItem; readonly attempt: number }
   | { readonly _tag: "PlayedUnseen"; readonly item: PlanItem }
@@ -254,11 +251,12 @@ export const reconcileStaged = (
   now: number
 ): { readonly state: SessionState; readonly repairs: ReadonlyArray<Repair> } => {
   const inQueue = (t: Track) => spotifyQueue.some((q) => sameTrack(q, t)) || (current !== undefined && sameTrack(current, t))
-  const truncated = spotifyQueue.length >= QUEUE_PAGE
   const results = state.staged.map((s): { readonly keep: StagedItem | undefined; readonly repair?: Repair } => {
     if (inQueue(s.item.track)) return { keep: s.misses ? { ...s, misses: 0 } : s }
     if (s.cancelled) return { keep: undefined }
-    if (truncated || now - s.staged_at < QUEUE_GRACE_MS) return { keep: s }
+    // Spotify lists its queue as: tracks added with "add to queue" (dj's, then the listener's), then the
+    // album/playlist/autoplay context. So dj's track is near the front even when the page is full.
+    if (now - s.staged_at < QUEUE_GRACE_MS) return { keep: s }
     const misses = (s.misses ?? 0) + 1
     if (misses < MISSES_TO_ACT) return { keep: { ...s, misses } }
     if (s.blind === true) return { keep: undefined, repair: { _tag: "PlayedUnseen", item: s.item } }

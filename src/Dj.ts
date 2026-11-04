@@ -387,8 +387,11 @@ export class Dj extends Context.Service<Dj, {
           if (checkDue) {
             yield* Ref.set(lastQueueCheck, now)
             const queue = yield* Effect.result(api.queue)
+            if (queue._tag === "Failure") yield* Effect.logWarning(`Couldn't read Spotify's queue: ${queue.failure.message}`)
             if (queue._tag === "Success") {
               const reconciled = Plan.reconcileStaged(next, queue.success.queue.map(toTrack), Option.getOrUndefined(view.track), now)
+              const missing = reconciled.state.staged.filter((x) => (x.misses ?? 0) > 0)
+              if (missing.length > 0) yield* Effect.logInfo(`Locked-in track not in Spotify's queue yet: ${missing.map((x) => x.item.track.name).join(", ")}`)
               next = reconciled.state
               yield* Effect.forEach(reconciled.repairs, (repair) => repairQueue(repair, view, next), { discard: true })
             }

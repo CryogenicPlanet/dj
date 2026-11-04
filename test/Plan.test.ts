@@ -268,11 +268,11 @@ describe("queue reconciliation", () => {
     expect(twice.repairs).toEqual([])
   })
 
-  test("a truncated queue page proves nothing", () => {
+  test("a full page of album and autoplay tracks still counts as missing", () => {
     const s = staged(withPlan(A, B))
-    const full = Array.from({ length: Plan.QUEUE_PAGE }, (_, i) => track(`X${i}`))
+    const full = Array.from({ length: 20 }, (_, i) => track(`X${i}`))
     const r = Plan.reconcileStaged(Plan.reconcileStaged(s, full, undefined, later(0)).state, full, undefined, later(30_000))
-    expect(r.repairs).toEqual([])
+    expect(r.repairs.map((x) => x._tag)).toEqual(["Readd"])
   })
 
   test("if Spotify was hiding playback, a vanished track counts as played unseen", () => {
