@@ -1,8 +1,8 @@
 /**
  * dj for chirp: a thin proxy to the dj service (Rahul's Spotify DJ, https://dj.cryo.wtf).
  *
- * Installed at app/ext/mcp/dj.ts on the chirp board; the source of truth lives in the vibeq repo
- * (chirp/mcp/dj.ts). Two surfaces share the proxy below:
+ * Installed at app/ext/mcp/dj.ts on the chirp board; the source of truth is github.com/CryogenicPlanet/dj
+ * (chirp/ext/mcp/dj.ts). Two surfaces share the proxy below:
  * - MCP: `dj_guide` returns the playbook and the live tool catalog, `dj` calls any dj tool by name.
  *   Only two tools, so connections that never touch music pay almost nothing in tool schemas.
  * - Board API (app/ext/dj.ts): `GET /api/dj` and `POST /api/dj/:tool` for chirp clients using tokens.

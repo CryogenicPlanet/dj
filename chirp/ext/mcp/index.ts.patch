@@ -1,6 +1,6 @@
 Changes to chirp's app/ext/mcp/index.ts (applied 2026-11-03 against version 29628f3a):
 
-0. app/ext/dj.ts (repo: chirp/dj.ts) is a separate extension for the board API routes; it imports the proxy from ./mcp/dj.ts.
+0. app/ext/dj.ts (repo: chirp/ext/dj.ts) is a separate extension for the board API routes; it imports the proxy from ./mcp/dj.ts.
 
 1. Import, next to the editing import:
      import { callDj, djNames, djTools } from "./dj.ts";

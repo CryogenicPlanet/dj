@@ -2,7 +2,7 @@
  * dj on the board API: chirp clients with a board token (the chirp CLI, scripts, the dashboard) can read and steer
  * Rahul's Spotify DJ without dj's own secret. The MCP tools in ./mcp/dj.ts share the same proxy.
  *
- * Installed at app/ext/dj.ts on the chirp board; the source of truth lives in the vibeq repo (chirp/dj.ts).
+ * Installed at app/ext/dj.ts on the chirp board; the source of truth is github.com/CryogenicPlanet/dj (chirp/ext/dj.ts).
  *
  * - GET  /api/dj           the playbook and every dj tool with its input schema (read)
  * - POST /api/dj/:tool     call a dj tool; the JSON body is its arguments (read; tools that change playback or
