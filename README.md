@@ -78,7 +78,7 @@ Locally, dj binds to `127.0.0.1` and needs no auth, because only your machine ca
 
 Most people will have their agent set dj up. If that's you, agent: dj works without any of this, but the picks get much more personal with it. Work through the list below. Some steps need the person, so ask them and keep going with the rest while you wait. Restart dj after changing config. On a server, set the matching environment variables instead (see [Deploy it](#deploy-it)).
 
-1. **Streaming history: ask the person first, because it takes days to arrive.** They request it at [spotify.com/account/privacy](https://www.spotify.com/account/privacy/) by ticking **Extended streaming history**. Spotify emails a zip within 30 days. When they give it to you, read its `Streaming_History_Audio_*.json` files. Each entry is one play, with `ts`, `ms_played`, `master_metadata_track_name`, `master_metadata_album_artist_name`, `spotify_track_uri`, `reason_end`, and `skipped`. Write a script that aggregates them into `track_metrics.csv`, one row per artist and track:
+1. **Streaming history: ask the person first, because it takes days to arrive.** They request it at [spotify.com/account/privacy](https://www.spotify.com/account/privacy/) by ticking **Extended streaming history**. Spotify emails a zip within 30 days. When they give it to you, read its `Streaming_History_Audio_*.json` files (older exports name them `endsong_*.json`). Each entry is one play, with `ts`, `ms_played`, `master_metadata_track_name`, `master_metadata_album_artist_name`, `spotify_track_uri`, `reason_end`, and `skipped`. Write a script that aggregates them into `track_metrics.csv`, one row per artist and track:
 
    | Column | Meaning |
    |---|---|
@@ -91,13 +91,15 @@ Most people will have their agent set dj up. If that's you, agent: dj works with
    | `last_90d_meaningful`, `last_365d_meaningful` | Meaningful plays in the last 90 and 365 days |
    | `lifetime_hours` | Sum of `ms_played`, in hours |
 
-   Then run `vibeq config set history-dir <folder containing the csv>`. This powers `listening_history` and the play counts on every track.
+   Then run `vibeq config set history-dir <folder containing the csv>`. This powers `listening_history` and the play counts on every track. On a server, upload it with `POST /api/admin/import/track_metrics.csv`, which saves it to `/data/history/`, and set `VIBEQ_HISTORY_DIR=/data/history`.
+
+   The CSV is a snapshot that dj reads at startup, so its counts don't update as the person keeps listening. To refresh it, have them request a new export, rebuild the CSV, replace the file, and restart dj. stats.fm covers recent listening in the meantime.
 
 2. **stats.fm: the person signs in, you configure it.** Ask them to sign in at [stats.fm](https://stats.fm) with Spotify and make their profile public in its privacy settings. Get the id or custom name from their profile link, check that `https://api.stats.fm/api/v1/users/<id>` returns their profile, then run `vibeq config set statsfm-user <id>`. This gives live top artists and genres, plus recent plays.
 
 3. **Last.fm: the person creates a key.** Ask them for a free API key from [last.fm/api/account/create](https://www.last.fm/api/account/create). They don't need any scrobbling history. Run `vibeq config set lastfm-api-key <KEY>`. Spotify removed recommendations and related artists for development-mode apps, and this brings back similar tracks, similar artists, and tags.
 
-4. **Profile notes: you write these.** Interview the person about what they love, what they skip, and how a set should flow. Write it to a markdown file and run `vibeq config set profile-files <path>`. Agents treat this file as the ground truth about their taste and add to it through `update_profile`. Without the setting, notes go to `profile.md` in dj's home folder.
+4. **Profile notes: you write these.** Interview the person about what they love, what they skip, and how a set should flow. Write it to a markdown file and run `vibeq config set profile-files <path>`. Agents treat this file as the ground truth about their taste and add to it through `update_profile`. Without the setting, dj reads and writes `profile.md` in its home folder. On a server, upload it with `POST /api/admin/import/profile.md`, which saves it as `/data/profile.md`.
 
 5. **Tiers: you build these, after steps 1 and 2.** dj labels every track L1 (current rotation), L2 (core), or L3 (archive), and agents use the labels to balance familiar tracks with new ones. Build the tiers from the person's Liked Songs:
 
@@ -133,7 +135,7 @@ Set these variables on the service:
 | `VIBEQ_OWNER_SPOTIFY_ID` | Your Spotify user id. Only this account can link dj or approve apps |
 | `VIBEQ_PROXY_SECRET` | A random secret (`openssl rand -hex 32`) for the CLI, scripts, and chirp |
 | `VIBEQ_HOST` | `::` to listen on IPv6 too (Railway's private network). Defaults to `0.0.0.0` |
-| `LASTFM_API_KEY`, `STATSFM_USER`, `VIBEQ_PROFILE_FILES`, `VIBEQ_HISTORY_DIR` | Optional [taste data](#taste-data-for-the-agent-doing-setup). Point the files at `/data` |
+| `LASTFM_API_KEY`, `STATSFM_USER`, `VIBEQ_PROFILE_FILES`, `VIBEQ_HISTORY_DIR` | Optional [taste data](#taste-data-for-the-agent-doing-setup). Imported files land in `/data`: use `VIBEQ_HISTORY_DIR=/data/history` and `VIBEQ_PROFILE_FILES=/data/profile.md` |
 
 Then add `https://dj.example.com/callback` to your Spotify app's redirect URIs, open `https://dj.example.com/login`, and sign in with Spotify to link your account. The OAuth sign-in below uses the same redirect URI, so it needs to be registered even if you copied your login over from a local install.
 
