@@ -35,7 +35,7 @@ agent ──queue_songs──▶ plan [t4 t5 t6 t7 …]     editable at any time
 That's the core. On top of it, dj gives the agent what it needs to DJ well:
 
 - **Batch fuzzy resolution.** The agent sends `[{title, artist}]` in one call. dj searches Spotify, scores candidates (penalising karaoke, covers, live versions, and remixes you didn't ask for), and reports misses so the agent can fix them.
-- **Your real taste.** Curated profile notes, live [stats.fm](https://stats.fm) stats, a multi-year streaming-history export, and tier playlists (`L1 — …`, `L2 — …`, `L3 — …`). Every track an agent sees says how you know it ("L1 current rotation · liked · 48 plays") or that it's new to you.
+- **Your real taste.** Curated profile notes, live [stats.fm](https://stats.fm) stats, a multi-year streaming-history export, and L1/L2/L3 tiers. Every track an agent sees says how you know it ("L1 current rotation · liked · 48 plays") or that it's new to you.
 - **Similarity data.** Spotify removed recommendations, related artists, and audio features for development-mode apps. Optional Last.fm tools fill the gap.
 - **Memory.** History with vibe labels, feedback that persists across sessions, and a track cache of BPM, energy, tags, and transitions that worked.
 - **A DJ playbook.** dj's MCP instructions teach agents to bridge genres in 2–5 song transitions, build from the locked-in track, mix familiar tracks with discovery, and react to events instead of polling.
@@ -74,16 +74,46 @@ That's it! Ask your agent to play something. `vibeq status` checks the whole set
 
 Locally, dj binds to `127.0.0.1` and needs no auth, because only your machine can reach it.
 
-### Optional taste sources
+### Taste data (for the agent doing setup)
 
-Each one makes the agent's picks more personal:
+Most people will have their agent set dj up. If that's you, agent: dj works without any of this, but the picks get much more personal with it. Work through the list below. Some steps need the person, so ask them and keep going with the rest while you wait. Restart dj after changing config. On a server, set the matching environment variables instead (see [Deploy it](#deploy-it)).
 
-```bash
-vibeq config set lastfm-api-key <KEY>                       # similar tracks and tags (free key from last.fm/api)
-vibeq config set statsfm-user <stats.fm id>                 # live top artists and genres, from a public profile
-vibeq config set profile-files ~/notes/taste.md             # your own notes; the agent treats them as ground truth
-vibeq config set history-dir <dir with track_metrics.csv>   # multi-year play counts and skip rates
-```
+1. **Streaming history: ask the person first, because it takes days to arrive.** They request it at [spotify.com/account/privacy](https://www.spotify.com/account/privacy/) by ticking **Extended streaming history**. Spotify emails a zip within 30 days. When they give it to you, read its `Streaming_History_Audio_*.json` files (older exports name them `endsong_*.json`). Each entry is one play, with `ts`, `ms_played`, `master_metadata_track_name`, `master_metadata_album_artist_name`, `spotify_track_uri`, `reason_end`, and `skipped`. Write a script that aggregates them into `track_metrics.csv`, one row per artist and track:
+
+   | Column | Meaning |
+   |---|---|
+   | `artist`, `track` | Artist and track name |
+   | `spotify_uris` | Every `spotify:track:…` URI seen for it, separated by `\|` |
+   | `meaningful_plays` | Plays of 30 seconds or more |
+   | `explicit_skips` | Plays where `skipped` is true |
+   | `short_play_rate` | Fraction of plays under 30 seconds (0–1) |
+   | `last_ts` | Latest play's `ts` (ISO 8601) |
+   | `last_90d_meaningful`, `last_365d_meaningful` | Meaningful plays in the last 90 and 365 days |
+   | `lifetime_hours` | Sum of `ms_played`, in hours |
+
+   Then run `vibeq config set history-dir <folder containing the csv>`. This powers `listening_history` and the play counts on every track. On a server, upload it with `POST /api/admin/import/track_metrics.csv`, which saves it to `/data/history/`, and set `VIBEQ_HISTORY_DIR=/data/history`.
+
+   The CSV is a snapshot that dj reads at startup, so its counts don't update as the person keeps listening. To refresh it, have them request a new export, rebuild the CSV, replace the file, and restart dj. stats.fm covers recent listening in the meantime.
+
+2. **stats.fm: the person signs in, you configure it.** Ask them to sign in at [stats.fm](https://stats.fm) with Spotify and make their profile public in its privacy settings. Get the id or custom name from their profile link, check that `https://api.stats.fm/api/v1/users/<id>` returns their profile, then run `vibeq config set statsfm-user <id>`. This gives live top artists and genres, plus recent plays.
+
+3. **Last.fm: the person creates a key.** Ask them for a free API key from [last.fm/api/account/create](https://www.last.fm/api/account/create). They don't need any scrobbling history. Run `vibeq config set lastfm-api-key <KEY>`. Spotify removed recommendations and related artists for development-mode apps, and this brings back similar tracks, similar artists, and tags.
+
+4. **Profile notes: you write these.** Interview the person about what they love, what they skip, and how a set should flow. Write it to a markdown file and run `vibeq config set profile-files <path>`. Agents treat this file as the ground truth about their taste and add to it through `update_profile`. Without the setting, dj reads and writes `profile.md` in its home folder. On a server, upload it with `POST /api/admin/import/profile.md`, which saves it as `/data/profile.md`.
+
+5. **Tiers: you build these, after steps 1 and 2.** dj labels every track L1 (current rotation), L2 (core), or L3 (archive), and agents use the labels to balance familiar tracks with new ones. Build the tiers from the person's Liked Songs:
+
+   - **L3, the archive:** every Liked Song.
+   - **L2, the core (about 500):** all of L1, plus the durable favourites that score highest on `meaningful_plays + 2 × last_365d_meaningful + 5 × years played`, counting the years from the raw export. Break ties by current listening.
+   - **L1, current rotation (about 200):** about three quarters from what they play now. Use Spotify's short-term top tracks and recent stats.fm streams, weighted toward the last few weeks and toward tracks played on many different days. Fill the rest with durable favourites they still play. Cap any one artist at 12 tracks. Leave film scores, intros, interludes, and skits to L2 and L3, because they're for focused listening, not everyday shuffle.
+
+   For a small library, scale the sizes down: L1 at about an eighth of their Likes and L2 at about a third. Without a streaming history, rank by stats.fm and Spotify's top tracks, with `medium_term` and `long_term` standing in for the durable score.
+
+   Write the result to `tiers.csv` in dj's home folder (`~/.config/vibeq/` locally). Use `uri` and `tier` columns, one row per track at its best tier: L1 beats L2, which beats L3. On a server, upload it with `POST /api/admin/import/tiers.csv`, then `POST /api/admin/restart`. dj loads tiers at startup and every 6 hours.
+
+   **Only if the person wants the tiers on Spotify too**, save each one as a private playlist: call `save_playlist` with `uris`, using the names `L1 — Current Rotation`, `L2 — Core Collection`, and `L3 — Full Archive`. dj also reads any playlist whose name starts with `L1`, `L2`, or `L3`, and merges it with `tiers.csv`. `save_playlist` always creates a new playlist, so when you refresh the tiers, ask the person to delete the old ones. Don't change their Liked Songs unless they ask.
+
+When you're done, confirm that dj picked each source up: `my_taste` should show the profile notes, `listening_history` should return rows, `listening_stats` should return stats.fm data, `similar_tracks` should answer, and tracks from `liked_songs` should show their tier.
 
 ## Deploy it
 
@@ -105,7 +135,7 @@ Set these variables on the service:
 | `VIBEQ_OWNER_SPOTIFY_ID` | Your Spotify user id. Only this account can link dj or approve apps |
 | `VIBEQ_PROXY_SECRET` | A random secret (`openssl rand -hex 32`) for the CLI, scripts, and chirp |
 | `VIBEQ_HOST` | `::` to listen on IPv6 too (Railway's private network). Defaults to `0.0.0.0` |
-| `LASTFM_API_KEY`, `STATSFM_USER`, `VIBEQ_PROFILE_FILES`, `VIBEQ_HISTORY_DIR` | Optional taste sources, as above. Point the files at `/data` |
+| `LASTFM_API_KEY`, `STATSFM_USER`, `VIBEQ_PROFILE_FILES`, `VIBEQ_HISTORY_DIR` | Optional [taste data](#taste-data-for-the-agent-doing-setup). Imported files land in `/data`: use `VIBEQ_HISTORY_DIR=/data/history` and `VIBEQ_PROFILE_FILES=/data/profile.md` |
 
 Then add `https://dj.example.com/callback` to your Spotify app's redirect URIs, open `https://dj.example.com/login`, and sign in with Spotify to link your account. The OAuth sign-in below uses the same redirect URI, so it needs to be registered even if you copied your login over from a local install.
 
@@ -216,7 +246,7 @@ A lease lapses on its own, so a crashed agent never leaves the music unsteered. 
 | `liked_songs` | Recent or random Liked Songs |
 | `playlists` | List your playlists, or read one in order |
 | `feedback` | Save love, like, meh, dislike, or hate, with an optional note |
-| `save_playlist` | Save the session's set as a playlist |
+| `save_playlist` | Save the session's set, or an exact list of `uris`, as a playlist |
 | `annotate_tracks` | Record lane, energy (1–10), tags, and notes in the track cache |
 | `find_tracks` | Query the cache by lane, tag, BPM range, energy, tier, or text |
 | `transitions` | A → B pairs that actually played, and whether B was skipped |
@@ -232,7 +262,7 @@ From a shell, `vibeq tools` lists them, and `vibeq wait --types track_started,sk
 dj builds a personal music graph in `tracks.db` (SQLite):
 
 - **BPM and loudness** come from Deezer, looked up by ISRC in the background.
-- **Tier** comes from playlists named `L1 — …`, `L2 — …`, and `L3 — …`, refreshed every 6 hours. Liked status is checked daily.
+- **Tier** comes from `tiers.csv` and from playlists named `L1 — …`, `L2 — …`, and `L3 — …`, refreshed every 6 hours. Liked status is checked daily.
 - **Lane, energy, tags, and notes** are written by agents through `annotate_tracks`.
 - **Transitions** record every A → B that played, and whether B was skipped. A skip means you moved on before 70% of the track with more than 45 seconds left, so Automix's early fades don't count.
 

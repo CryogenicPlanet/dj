@@ -28,7 +28,16 @@ export class Profile extends Context.Service<Profile, {
           Effect.catch((cause) => Effect.logWarning(`Can't read profile file ${file}`, cause).pipe(Effect.as(Option.none<string>())))
         )
 
-      const read = Effect.forEach(config.profileFiles, readOne).pipe(
+      const notesFile = config.profileFiles.at(-1) ?? path.join(config.home, "profile.md")
+      // With no profile files configured, read the default notes file that update_profile writes to.
+      // A missing default file just means no notes yet, so it isn't worth a warning.
+      const readDefault = Effect.flatMap(fs.exists(notesFile).pipe(Effect.orElseSucceed(() => false)), (exists) =>
+        exists ? readOne(notesFile) : Effect.succeed(Option.none<string>()))
+      const parts = config.profileFiles.length > 0
+        ? Effect.forEach(config.profileFiles, readOne)
+        : Effect.map(readDefault, (p) => [p])
+
+      const read = parts.pipe(
         Effect.map((parts) => {
           const text = parts.flatMap((p) => (Option.isSome(p) ? [p.value] : [])).join("\n\n---\n\n")
           if (text.length === 0) return Option.none<string>()
@@ -36,7 +45,6 @@ export class Profile extends Context.Service<Profile, {
         })
       )
 
-      const notesFile = config.profileFiles.at(-1) ?? path.join(config.home, "profile.md")
       const current = fs.readFileString(notesFile).pipe(Effect.orElseSucceed(() => ""))
       const write = (text: string) => Effect.as(fs.writeFileString(notesFile, text), text.length)
 
