@@ -36,6 +36,8 @@ export interface AppConfigShape {
     readonly token: string
     readonly session: string
     readonly feedback: string
+    /** Tier list an agent built from history and stats (`uri,tier`). Merged with L1/L2/L3 playlists. */
+    readonly tiers: string
   }
   readonly spotifyClientId: Option.Option<string>
   readonly lastfmApiKey: Option.Option<string>
@@ -71,7 +73,8 @@ export class AppConfig extends Context.Service<AppConfig, AppConfigShape>()("vib
         config: path.join(home, "config.json"),
         token: path.join(home, "token.json"),
         session: path.join(home, "session.json"),
-        feedback: path.join(home, "feedback.json")
+        feedback: path.join(home, "feedback.json"),
+        tiers: path.join(home, "tiers.csv")
       }
       const file = yield* readConfigFile(paths.config)
       const envPort = yield* Config.option(Config.Port("PORT"))

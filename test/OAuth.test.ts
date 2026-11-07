@@ -86,7 +86,7 @@ const testLayer = (spotifyId: string) =>
       ownerSpotifyId: Option.some("owner-id"),
       baseUrl: "http://127.0.0.1:8080",
       redirectUri: `${ORIGIN}/callback`,
-      paths: { config: "", token: "", session: "", feedback: "" },
+      paths: { config: "", token: "", session: "", feedback: "", tiers: "" },
       spotifyClientId: Option.some("client"),
       lastfmApiKey: Option.none(),
       profileFiles: [],

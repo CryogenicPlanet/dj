@@ -35,7 +35,7 @@ agent ──queue_songs──▶ plan [t4 t5 t6 t7 …]     editable at any time
 That's the core. On top of it, dj gives the agent what it needs to DJ well:
 
 - **Batch fuzzy resolution.** The agent sends `[{title, artist}]` in one call. dj searches Spotify, scores candidates (penalising karaoke, covers, live versions, and remixes you didn't ask for), and reports misses so the agent can fix them.
-- **Your real taste.** Curated profile notes, live [stats.fm](https://stats.fm) stats, a multi-year streaming-history export, and tier playlists (`L1 — …`, `L2 — …`, `L3 — …`). Every track an agent sees says how you know it ("L1 current rotation · liked · 48 plays") or that it's new to you.
+- **Your real taste.** Curated profile notes, live [stats.fm](https://stats.fm) stats, a multi-year streaming-history export, and L1/L2/L3 tiers. Every track an agent sees says how you know it ("L1 current rotation · liked · 48 plays") or that it's new to you.
 - **Similarity data.** Spotify removed recommendations, related artists, and audio features for development-mode apps. Optional Last.fm tools fill the gap.
 - **Memory.** History with vibe labels, feedback that persists across sessions, and a track cache of BPM, energy, tags, and transitions that worked.
 - **A DJ playbook.** dj's MCP instructions teach agents to bridge genres in 2–5 song transitions, build from the locked-in track, mix familiar tracks with discovery, and react to events instead of polling.
@@ -99,9 +99,19 @@ Most people will have their agent set dj up. If that's you, agent: dj works with
 
 4. **Profile notes: you write these.** Interview the person about what they love, what they skip, and how a set should flow. Write it to a markdown file and run `vibeq config set profile-files <path>`. Agents treat this file as the ground truth about their taste and add to it through `update_profile`. Without the setting, notes go to `profile.md` in dj's home folder.
 
-5. **Tier playlists: optional, and nothing to configure.** If the person keeps playlists named `L1 — …` (current rotation), `L2 — …` (core), or `L3 — …` (archive), dj finds them by name and labels every track with its tier. Offer to build them from their history if they'd like.
+5. **Tiers: you build these, after steps 1 and 2.** dj labels every track L1 (current rotation), L2 (core), or L3 (archive), and agents use the labels to balance familiar tracks with new ones. Build the tiers from the person's Liked Songs:
 
-When you're done, confirm that dj picked each source up: `my_taste` should show the profile notes, `listening_history` should return rows, `listening_stats` should return stats.fm data, and `similar_tracks` should answer.
+   - **L3, the archive:** every Liked Song.
+   - **L2, the core (about 500):** all of L1, plus the durable favourites that score highest on `meaningful_plays + 2 × last_365d_meaningful + 5 × years played`, counting the years from the raw export. Break ties by current listening.
+   - **L1, current rotation (about 200):** about three quarters from what they play now. Use Spotify's short-term top tracks and recent stats.fm streams, weighted toward the last few weeks and toward tracks played on many different days. Fill the rest with durable favourites they still play. Cap any one artist at 12 tracks. Leave film scores, intros, interludes, and skits to L2 and L3, because they're for focused listening, not everyday shuffle.
+
+   For a small library, scale the sizes down: L1 at about an eighth of their Likes and L2 at about a third. Without a streaming history, rank by stats.fm and Spotify's top tracks, with `medium_term` and `long_term` standing in for the durable score.
+
+   Write the result to `tiers.csv` in dj's home folder (`~/.config/vibeq/` locally). Use `uri` and `tier` columns, one row per track at its best tier: L1 beats L2, which beats L3. On a server, upload it with `POST /api/admin/import/tiers.csv`, then `POST /api/admin/restart`. dj loads tiers at startup and every 6 hours.
+
+   **Only if the person wants the tiers on Spotify too**, save each one as a private playlist: call `save_playlist` with `uris`, using the names `L1 — Current Rotation`, `L2 — Core Collection`, and `L3 — Full Archive`. dj also reads any playlist whose name starts with `L1`, `L2`, or `L3`, and merges it with `tiers.csv`. `save_playlist` always creates a new playlist, so when you refresh the tiers, ask the person to delete the old ones. Don't change their Liked Songs unless they ask.
+
+When you're done, confirm that dj picked each source up: `my_taste` should show the profile notes, `listening_history` should return rows, `listening_stats` should return stats.fm data, `similar_tracks` should answer, and tracks from `liked_songs` should show their tier.
 
 ## Deploy it
 
@@ -234,7 +244,7 @@ A lease lapses on its own, so a crashed agent never leaves the music unsteered. 
 | `liked_songs` | Recent or random Liked Songs |
 | `playlists` | List your playlists, or read one in order |
 | `feedback` | Save love, like, meh, dislike, or hate, with an optional note |
-| `save_playlist` | Save the session's set as a playlist |
+| `save_playlist` | Save the session's set, or an exact list of `uris`, as a playlist |
 | `annotate_tracks` | Record lane, energy (1–10), tags, and notes in the track cache |
 | `find_tracks` | Query the cache by lane, tag, BPM range, energy, tier, or text |
 | `transitions` | A → B pairs that actually played, and whether B was skipped |
@@ -250,7 +260,7 @@ From a shell, `vibeq tools` lists them, and `vibeq wait --types track_started,sk
 dj builds a personal music graph in `tracks.db` (SQLite):
 
 - **BPM and loudness** come from Deezer, looked up by ISRC in the background.
-- **Tier** comes from playlists named `L1 — …`, `L2 — …`, and `L3 — …`, refreshed every 6 hours. Liked status is checked daily.
+- **Tier** comes from `tiers.csv` and from playlists named `L1 — …`, `L2 — …`, and `L3 — …`, refreshed every 6 hours. Liked status is checked daily.
 - **Lane, energy, tags, and notes** are written by agents through `annotate_tracks`.
 - **Transitions** record every A → B that played, and whether B was skipped. A skip means you moved on before 70% of the track with more than 45 seconds left, so Automix's early fades don't count.
 

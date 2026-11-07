@@ -315,9 +315,12 @@ const RecordFeedback = Tool.make("feedback", {
 })
 
 const SavePlaylist = Tool.make("save_playlist", {
-  description: "Save this session's set as a new Spotify playlist.",
+  description: "Save this session's set as a new Spotify playlist, or pass `uris` to save exactly those tracks (e.g. tier playlists).",
   parameters: Schema.Struct({
     name: Schema.String,
+    uris: Schema.optional(Schema.Array(Schema.String)).annotate({
+      description: "Exact spotify:track: URIs to save, in order. Overrides include/only_planned."
+    }),
     description: withDefault(Schema.String, "Curated live by vibeq"),
     include: withDefault(Schema.Literals(["played", "played_and_plan", "plan"]), "played"),
     only_planned: withDefault(Schema.Boolean, true, "Only include tracks vibeq queued (exclude autoplay/manual picks)"),
@@ -835,7 +838,9 @@ export const VibeToolkitLayer: Layer.Layer<
           const played = state.history.filter((h) => !params.only_planned || h.source === "plan").map((h) => h.track.uri)
           const upcoming = [...state.staged.filter((s) => !s.cancelled).map((s) => s.item), ...state.plan].map((p) => p.track.uri)
           const uris = dedupeLabels(
-            params.include === "played" ? played : params.include === "plan" ? upcoming : [...played, ...upcoming]
+            params.uris !== undefined
+              ? params.uris
+              : params.include === "played" ? played : params.include === "plan" ? upcoming : [...played, ...upcoming]
           )
           if (uris.length === 0) return yield* new ToolError({ message: "Nothing to save yet for that selection." })
           const playlist = yield* api.createPlaylist(params.name, params.description, params.public)

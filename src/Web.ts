@@ -24,6 +24,7 @@ const IMPORTABLE: Record<string, (home: string, path: Path.Path) => string> = {
   "profile.md": (h, p) => p.join(h, "profile.md"),
   "dj-profile.md": (h, p) => p.join(h, "dj-profile.md"),
   "track_metrics.csv": (h, p) => p.join(h, "history", "track_metrics.csv"),
+  "tiers.csv": (h, p) => p.join(h, "tiers.csv"),
   "tracks.db": (h, p) => p.join(h, "tracks.db.import"),
   "feedback.json": (h, p) => p.join(h, "feedback.json"),
   "session.json": (h, p) => p.join(h, "session.json"),
