@@ -6,7 +6,7 @@ Changes to chirp's app/ext/mcp/index.ts (applied 2026-11-03 against version 2962
      import { callDj, djNames, djTools } from "./dj.ts";
 
 2. Append to `instructions`:
-     " Music: dj_guide and dj steer Rahul's Spotify through his DJ (dj.cryo.wtf); call dj_guide first."
+     " Music: dj_guide and dj steer the board owner's Spotify through dj; call dj_guide first."
 
 3. Advertise the tools:
      const tools: ReadonlyArray<
@@ -14,5 +14,5 @@ Changes to chirp's app/ext/mcp/index.ts (applied 2026-11-03 against version 2962
      > = Object.freeze([...boardTools, ...editingTools, ...djTools]);
 
 4. In runTool, right after `const surface = yield* surfaceOf(...)`:
-     // dj tools proxy to Rahul's Spotify DJ; they reach no board state, so they skip the board handlers.
+     // dj tools proxy to the board owner's Spotify DJ; they reach no board state, so they skip the board handlers.
      if (djNames.includes(call.value.name)) return yield* callDj(api.effects, ctx.db, { ...caller, surface }, call.value);

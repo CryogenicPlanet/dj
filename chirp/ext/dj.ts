@@ -1,6 +1,6 @@
 /**
  * dj on the board API: chirp clients with a board token (the chirp CLI, scripts, the dashboard) can read and steer
- * Rahul's Spotify DJ without dj's own secret. The MCP tools in ./mcp/dj.ts share the same proxy.
+ * the board owner's Spotify DJ without dj's own secret. The MCP tools in ./mcp/dj.ts share the same proxy.
  *
  * Installed at app/ext/dj.ts on the chirp board; the source of truth is github.com/CryogenicPlanet/dj (chirp/ext/dj.ts).
  *
@@ -83,7 +83,7 @@ export default (api: Api) =>
 
 		api.route("GET", "/api/dj", {
 			description:
-				"Rahul's Spotify DJ (dj.cryo.wtf): the playbook for steering his music and every dj tool with its input schema.",
+				"The board owner's Spotify DJ: the playbook for steering their music and every dj tool with its input schema.",
 			scope: "read",
 			handler: (_request, ctx) =>
 				Effect.gen(function* () {

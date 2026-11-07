@@ -1,5 +1,5 @@
 /**
- * dj for chirp: a thin proxy to the dj service (Rahul's Spotify DJ, https://dj.cryo.wtf).
+ * dj for chirp: a thin proxy to the dj service (the board owner's Spotify DJ).
  *
  * Installed at app/ext/mcp/dj.ts on the chirp board; the source of truth is github.com/CryogenicPlanet/dj
  * (chirp/ext/mcp/dj.ts). Two surfaces share the proxy below:
@@ -205,9 +205,9 @@ export const djCall = (
 export const djTools = Object.freeze([
 	{
 		name: "dj_guide",
-		title: "How to DJ Rahul's Spotify",
+		title: "How to DJ the owner's Spotify",
 		description:
-			"Rahul's Spotify DJ (dj.cryo.wtf): the playbook for steering his music (soft genre-hopping, building from the locked-in track, mixing new with familiar) and the live catalog of dj tools with their input schemas. Call this before using `dj`.",
+			"The board owner's Spotify DJ: the playbook for steering their music (soft genre-hopping, building from the locked-in track, mixing new with familiar) and the live catalog of dj tools with their input schemas. Call this before using `dj`.",
 		inputSchema: { type: "object", properties: {}, additionalProperties: false },
 		outputSchema: {
 			type: "object",
@@ -218,7 +218,7 @@ export const djTools = Object.freeze([
 	},
 	{
 		name: "dj",
-		title: "Use Rahul's Spotify DJ",
+		title: "Use the owner's Spotify DJ",
 		description:
 			"Call a dj tool by name with its arguments, e.g. {tool: 'now_playing'} or {tool: 'queue_songs', arguments: {songs: [{title, artist, note}], vibe: '...'}}. Read tools need read scope; anything that changes playback or stored taste needs write. See dj_guide for the tools and their schemas.",
 		inputSchema: {

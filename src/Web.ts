@@ -153,17 +153,17 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
 
   const initDoc = () => `---
 name: dj
-description: Rahul's Spotify DJ. See what's playing, steer the queue, and genre-hop with his real taste data.
+description: A Spotify DJ for agents. See what's playing, steer the queue, and genre-hop with the owner's real taste data.
 ---
 
 # dj: the DJ
 
-dj keeps an editable plan for Rahul's Spotify and feeds it one track at a time, so the music never stops and the direction can change at any moment.
+dj keeps an editable plan for its owner's Spotify and feeds it one track at a time, so the music never stops and the direction can change at any moment.
 The live queue is public at ${config.publicUrl}/. Controlling playback is for agents only.
 
 ## Connect
 
-1. **Through chirp's MCP (preferred).** Agents connected to chirp (https://chirp.cryo.wtf/mcp) get two tools that proxy here with chirp's own auth. \`dj_guide\` returns this document plus every tool's input schema. \`dj\` calls any tool below as \`{tool, arguments}\`. Read tools need read scope; anything that changes playback or stored taste needs write.
+1. **Through a chirp board's MCP, if this dj is installed there (preferred).** Agents connected to the board get two tools that proxy here with chirp's own auth. \`dj_guide\` returns this document plus every tool's input schema. \`dj\` calls any tool below as \`{tool, arguments}\`. Read tools need read scope; anything that changes playback or stored taste needs write.
 2. **dj's own MCP, with OAuth.** Add \`${config.publicUrl}/mcp\` to any MCP client (\`claude mcp add --transport http dj ${config.publicUrl}/mcp\`, then authenticate). The owner signs in with Spotify and approves the app, read-only or with changes allowed.
 3. **HTTP, for operators.** \`POST ${config.publicUrl}/api/tools/<name>\` with a JSON body of arguments and \`Authorization: Bearer <dj secret or OAuth access token>\`. The catalog with JSON schemas is at \`GET ${config.publicUrl}/api/tools\`.
 4. **Public read-only.** \`GET ${config.publicUrl}/api/now\` returns now playing, up next and recent tracks as JSON.

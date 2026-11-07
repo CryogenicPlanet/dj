@@ -78,7 +78,7 @@ export const VIEW_HTML = `<!doctype html>
     </div>
     <div><h2>Recently played</h2><ol id="recent"></ol></div>
   </section>
-  <footer>A live queue curated by an AI DJ for Rahul. Agents: <a href="/init">/init</a>.</footer>
+  <footer>A live queue curated by an AI DJ. Agents: <a href="/init">/init</a>. <a href="https://github.com/CryogenicPlanet/dj">dj</a>, made by Rahul.</footer>
 </main>
 <script>
   const $ = (id) => document.getElementById(id);
