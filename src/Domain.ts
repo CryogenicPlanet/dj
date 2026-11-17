@@ -218,7 +218,9 @@ export const HistoryEntry = Schema.Struct({
   /** Set when the listener moved on well before the track ended. */
   skipped_after_ms: Schema.optional(Schema.Number),
   /** It left Spotify's queue while Spotify was hiding playback, so dj counts it as played without having seen it. */
-  unseen: Schema.optional(Schema.Boolean)
+  unseen: Schema.optional(Schema.Boolean),
+  /** The plan key it played as, when it came from the plan. Links a played track back to a guest's suggestion. */
+  key: Schema.optional(Schema.String)
 })
 export type HistoryEntry = typeof HistoryEntry.Type
 
@@ -233,13 +235,60 @@ export const Driver = Schema.Struct({
 })
 export type Driver = typeof Driver.Type
 
+/**
+ * How guests' suggestions reach the music. In every mode but "off" they fill the gap when the plan runs dry.
+ * "weave" also asks the driver to fit each one into its set within a few tracks; "fill" leaves them for the gaps.
+ */
+export const GuestMode = Schema.Literals(["weave", "fill", "off"])
+export type GuestMode = typeof GuestMode.Type
+
+/** Time-boxed access for someone else's agent. The link's code is a bearer secret, so only its hash is stored. */
+export const Invite = Schema.Struct({
+  id: Schema.String,
+  code_hash: Schema.String,
+  name: Schema.String,
+  created_at: Schema.Number,
+  expires_at: Schema.Number,
+  created_by: Schema.String,
+  revoked: Schema.optional(Schema.Boolean)
+})
+export type Invite = typeof Invite.Type
+
+export const SuggestionStatus = Schema.Literals(["open", "accepted", "played", "rejected", "withdrawn", "expired", "dropped"])
+export type SuggestionStatus = typeof SuggestionStatus.Type
+
+/** A song a guest wants played. Guests never touch the plan: the driver accepts it, or the feeder plays it in a gap. */
+export const Suggestion = Schema.Struct({
+  key: Schema.String,
+  track: Track,
+  note: Schema.optional(Schema.String),
+  guest: Schema.String,
+  invite: Schema.String,
+  added_at: Schema.Number,
+  status: SuggestionStatus,
+  /** Why it was rejected or dropped. */
+  reason: Schema.optional(Schema.String),
+  /** The plan item it became once accepted (by the driver, or by the feeder filling a gap). */
+  plan_key: Schema.optional(Schema.String),
+  /** Who placed it: the driver, or "gap" when the feeder played it because the plan ran dry. */
+  placed_by: Schema.optional(Schema.String),
+  closed_at: Schema.optional(Schema.Number),
+  /** Times Spotify refused to queue it for a gap. */
+  fill_failures: Schema.optional(Schema.Number)
+})
+export type Suggestion = typeof Suggestion.Type
+
 export const SessionState = Schema.Struct({
   plan: Schema.Array(PlanItem),
   staged: Schema.Array(StagedItem),
   history: Schema.Array(HistoryEntry),
   last_seen_uri: Schema.NullOr(Schema.String),
   next_key: Schema.Number,
-  driver: Schema.optional(Driver)
+  driver: Schema.optional(Driver),
+  invites: Schema.optional(Schema.Array(Invite)),
+  suggestions: Schema.optional(Schema.Array(Suggestion)),
+  next_suggestion: Schema.optional(Schema.Number),
+  guest_mode: Schema.optional(GuestMode)
 })
 export type SessionState = typeof SessionState.Type
 

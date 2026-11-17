@@ -228,13 +228,34 @@ When several agents can reach dj, one drives at a time:
 
 A lease lapses on its own, so a crashed agent never leaves the music unsteered. Callers are named by their OAuth app, by chirp's `x-chirp-caller`, or `owner` for dj's secret.
 
+## Guests: let a friend's agent suggest songs
+
+Ask your agent to invite someone (`invite_guest {name: "sam"}`, or `vibeq invite sam`) and it returns a link that works for an hour (`minutes` changes that, up to 12 hours). Send the link to Sam. Their agent needs no MCP, no sign-in and no headers. It reads the link and follows the instructions there, all plain HTTP:
+
+```bash
+curl -s https://dj.example.com/g/<code>              # instructions for the agent
+curl -s https://dj.example.com/g/<code>/now          # what's playing, the plan, Sam's suggestions
+curl -s -X POST https://dj.example.com/g/<code>/suggest -H 'content-type: application/json' \
+  -d '{"songs":[{"title":"Archangel","artist":"Burial","note":"keeps the late-night drift going"}]}'
+curl -s "https://dj.example.com/g/<code>/wait?since=0"  # blocks until a track starts or a pick changes
+```
+
+Guests never touch the plan or take the driver lease, so the one-driver rule still holds. Each guest gets their own lane of suggestions, up to 5 waiting at a time:
+
+- **Your agent decides.** `now_playing.guests` lists open suggestions, and a `suggestion_added` event wakes the driver. It accepts one into the plan where it flows (`edit_plan {accept: ["s3"], accept_at: 1}`), or rejects it with a reason the guest sees.
+- **Gaps go to guests.** When the plan runs dry, dj locks in the next suggestion before Spotify's autoplay would. Guests take turns.
+- **Modes** (`guests {mode}`): `weave` (default) asks the driver to fit picks in within a few tracks. `fill` leaves them for gaps. `off` stops them playing on their own.
+- **Time's up.** After the hour, every guest endpoint returns 410, and open suggestions are dropped. Anything already accepted still plays. `guests {revoke: "<id>"}` ends a link early.
+
+Guests can search Spotify and see what's playing and what's planned. They can't control playback or read your history, taste profile or Liked Songs. The link is a secret: dj stores only its hash, and the live page shows who's in the booth.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `now_playing` | Playback, who's driving, the locked-in track, the plan, Spotify's own queue, recent history, and hints |
 | `queue_songs` | Batch resolve and add. `position`: `end`, `next`, or `replace`. Takes a `vibe` label and starts playback if idle |
-| `edit_plan` | Remove by key, move, clear, or reset history |
+| `edit_plan` | Remove by key, move, clear, or reset history. Accept or reject guest suggestions |
 | `play_now` | Interrupt with one song; the plan continues afterwards |
 | `playback` | Pause, resume, skip, previous, volume |
 | `devices` | List Spotify Connect devices and transfer playback |
@@ -251,6 +272,8 @@ A lease lapses on its own, so a crashed agent never leaves the music unsteered. 
 | `find_tracks` | Query the cache by lane, tag, BPM range, energy, tier, or text |
 | `transitions` | A → B pairs that actually played, and whether B was skipped |
 | `update_profile` | Append to or replace your notes file |
+| `invite_guest` | A time-boxed link for someone else's agent to suggest songs over plain HTTP |
+| `guests` | List live invites and open suggestions, revoke a link, or set the guest mode |
 | `similar_tracks`, `similar_artists`, `tag_tracks`, `tags`, `artist_top_tracks` | Last.fm similarity and tags (need an API key) |
 
 `queue_songs`, `edit_plan`, and `play_now` take `take_over`; see [Several agents, one booth](#several-agents-one-booth).

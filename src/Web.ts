@@ -6,6 +6,7 @@ import { CurrentCaller, READ_ONLY_TOOLS } from "./Caller.ts"
 import { bearerOf, callerName, McpOAuth, secretMatches } from "./OAuth.ts"
 import { Dj } from "./Dj.ts"
 import { type Track, toTrack } from "./Domain.ts"
+import * as Guests from "./Guests.ts"
 import { SpotifyApi } from "./SpotifyApi.ts"
 import { SERVER_INSTRUCTIONS } from "./Instructions.ts"
 import * as Plan from "./Plan.ts"
@@ -110,7 +111,8 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const locked = state.staged.filter((s) => !s.cancelled).map((s) => s.item)
       const current = Option.flatMap(pb, (p) => p.track)
       const currentVibe = state.history.at(-1)?.vibe ?? locked[0]?.vibe ?? state.plan[0]?.vibe
-      const driver = Plan.activeDriver(state, yield* Clock.currentTimeMillis)
+      const now = yield* Clock.currentTimeMillis
+      const driver = Plan.activeDriver(state, now)
       const queue = Option.isNone(pb) ? [] : yield* spotifyQueue
       return HttpServerResponse.jsonUnsafe({
         playing: Option.match(pb, {
@@ -129,6 +131,11 @@ export const WebRoutes = HttpRouter.use(Effect.fn(function*(router) {
           ...(p.vibe !== undefined ? { vibe: p.vibe } : {}),
           ...(p.note !== undefined ? { note: p.note } : {}),
           ...(p.by !== undefined ? { queued_by: Plan.callerAgent(p.by) } : {})
+        })),
+        guests: Guests.liveInvites(state, now).map((i) => ({
+          name: i.name,
+          minutes_left: Math.max(1, Math.ceil((i.expires_at - now) / 60_000)),
+          waiting: Guests.openSuggestions(state).filter((s) => s.invite === i.id).length
         })),
         spotify_queue: queue.map((t) => ({ ...publicTrack(t), from: Plan.queueSource(state, t) })),
         recent: state.history.slice(-12).toReversed().map((h) => ({

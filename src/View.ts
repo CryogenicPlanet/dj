@@ -108,7 +108,8 @@ export const VIEW_HTML = `<!doctype html>
       const d = await r.json();
       const p = d.playing, t = p && p.track;
       $("status").textContent = (p ? (p.is_playing ? "live · " + (p.device || "").toLowerCase() : "paused") : "nothing playing") +
-        (d.driver ? " · " + d.driver.name + " is driving" : "");
+        (d.driver ? " · " + d.driver.name + " is driving" : "") +
+        (d.guests || []).map((g) => " · " + g.name + " in the booth (" + g.minutes_left + " min left)").join("");
       $("state").textContent = p && !p.is_playing ? "paused" : "now playing";
       $("title").innerHTML = t ? '<a href="' + esc(t.url) + '">' + esc(t.title) + '</a>' : "—";
       $("artist").textContent = t ? t.artists : "";
