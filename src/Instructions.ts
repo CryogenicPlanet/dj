@@ -14,6 +14,8 @@ vibeq turns you into the listener's DJ on their real Spotify account. You pick t
 - Several agents can reach this DJ (through chirp). One drives at a time. **now_playing.driver** says who. Every plan change renews its author's lease, which lapses after 20 quiet minutes.
 - If someone else is driving, don't change the plan. queue_songs, edit_plan and play_now will refuse. Coordinate with the driver on chirp, or wait for the lease to lapse. Pass take_over: true only when the listener asked you to change the music. The other agent gets a driver_changed event.
 - Only the driver tops up on plan_low. If you're watching events but not driving, stay quiet unless the listener asks you for something.
+- **Guests.** When the listener asks, invite_guest makes a time-boxed link (default 1 hour) for someone else's agent. It uses plain HTTP, with no MCP or sign-in. Guests suggest songs into their own lane, see now_playing.guests. They never touch your plan or take the lease. You stay the DJ.
+  In the default "weave" mode, fit each suggestion into your set within the next ~3 tracks, where it transitions well: edit_plan accept:["s3"] accept_at:<index>. If it doesn't fit the room, reject it with a reason, which the guest sees. Leftover suggestions play by themselves when your plan runs dry, before Spotify's autoplay would. The suggestion_added event wakes you when one arrives. guests revokes a link or changes the mode ("fill": only when the plan runs dry; "off").
 - now_playing.spotify_queue shows Spotify's own queue. Tracks marked "spotify" right after dj's locked-in track are songs the listener added in the app. Let them play and build around them, don't talk over them.
 
 ## Workflow

@@ -1,18 +1,23 @@
 import { Clock, Context, Duration, Effect, FileSystem, Layer, Option, Queue, Ref, Schema, Semaphore } from "effect"
+import { createHash, randomBytes } from "node:crypto"
 import { AppConfig } from "./AppConfig.ts"
 import { CurrentCaller } from "./Caller.ts"
 import {
   type Driver,
   emptySession,
+  type GuestMode,
+  type Invite,
   type PlanItem,
   SessionState,
   type SpDevice,
   type SpPlaybackState,
+  type Suggestion,
   type Track,
   toTrack,
   trackLabel
 } from "./Domain.ts"
 import { Events } from "./Events.ts"
+import * as Guests from "./Guests.ts"
 import { readJsonFile, writeJsonFile } from "./JsonFile.ts"
 import * as Plan from "./Plan.ts"
 import { type Resolution, Resolver, type SongRequest } from "./Resolver.ts"
@@ -48,6 +53,17 @@ export interface QueueOutcome {
   readonly startError: Option.Option<string>
 }
 
+export interface SuggestOutcome {
+  readonly added: ReadonlyArray<Suggestion>
+  readonly duplicates: ReadonlyArray<Track>
+  readonly overLimit: ReadonlyArray<Track>
+  readonly unresolved: ReadonlyArray<Extract<Resolution, { _tag: "Unresolved" }>>
+  readonly lowConfidence: ReadonlyArray<{ readonly key: string; readonly asked: string; readonly got: Track; readonly confidence: number }>
+}
+
+/** A link's code is a bearer secret; dj stores and looks up only its hash. */
+export const hashCode = (code: string): string => createHash("sha256").update(code).digest("hex")
+
 export type ControlAction = "pause" | "resume" | "skip" | "previous" | "volume"
 
 export interface PlaybackView {
@@ -68,6 +84,17 @@ export class Dj extends Context.Service<Dj, {
   readonly clear: (resetHistory: boolean, takeOver: boolean) => Effect.Effect<SessionState, DjError>
   readonly control: (action: ControlAction, volume: Option.Option<number>) => Effect.Effect<void, DjFailure>
   readonly startPlan: Effect.Effect<PlanItem, DjFailure>
+  /** Mint a guest link's code. Owner-side: any caller with write access, never a guest. */
+  readonly createInvite: (name: string, minutes: number) => Effect.Effect<{ readonly code: string; readonly invite: Invite }, DjError>
+  readonly revokeInvite: (id: string) => Effect.Effect<Invite, DjError>
+  readonly setGuestMode: (mode: GuestMode) => Effect.Effect<void>
+  /** The invite a link's code belongs to, alive or not. */
+  readonly inviteForCode: (code: string) => Effect.Effect<Option.Option<Invite>>
+  readonly suggest: (invite: Invite, songs: ReadonlyArray<SongRequest>) => Effect.Effect<SuggestOutcome, DjFailure>
+  readonly withdraw: (invite: Invite, keys: ReadonlyArray<string>) => Effect.Effect<Guests.KeyedResult, DjError>
+  /** The driver's call: move suggestions into the plan. Needs the lease like any other plan change. */
+  readonly accept: (keys: ReadonlyArray<string>, toIndex: number, takeOver: boolean) => Effect.Effect<Guests.AcceptResult, DjError>
+  readonly reject: (keys: ReadonlyArray<string>, reason: string | undefined, takeOver: boolean) => Effect.Effect<Guests.KeyedResult, DjError>
 }>()("vibeq/Dj") {
   static readonly layer = Layer.effect(
     Dj,
@@ -120,7 +147,14 @@ export class Dj extends Context.Service<Dj, {
           ...stats
         })
         if (stats.plan_remaining === 0) {
-          yield* events.publish({ type: "plan_empty", detail: "Spotify autoplay is in charge until more songs are queued", ...stats })
+          const waiting = Guests.openSuggestions(after).length
+          yield* events.publish({
+            type: "plan_empty",
+            detail: waiting > 0 && Guests.modeOf(after) !== "off"
+              ? `Guests' suggestions fill the gap (${waiting} waiting), then Spotify autoplay, until more songs are queued`
+              : "Spotify autoplay is in charge until more songs are queued",
+            ...stats
+          })
         } else if (stats.plan_remaining <= 2) {
           yield* events.publish({ type: "plan_low", detail: `${stats.plan_remaining} planned track(s) left`, ...stats })
         }
@@ -137,15 +171,51 @@ export class Dj extends Context.Service<Dj, {
           Effect.catch((cause) => Effect.logWarning("Failed to persist session", cause))
         )
 
-      /** Apply a pure transition atomically, persist, and wake the feeder. */
+      /** Announce suggestions that are new or changed status, so the driver and the guest both hear. */
+      const announce = (before: SessionState, after: SessionState) =>
+        Effect.forEach(Guests.changes(before, after), ({ suggestion: s, was }) => {
+          const label = trackLabel(s.track)
+          const base = { track: label, uri: s.track.uri, guest: s.guest, key: s.key, ...planStats(after) }
+          switch (s.status) {
+            case "open":
+              return was === undefined
+                ? events.publish({
+                  type: "suggestion_added",
+                  detail: `${s.guest} (guest) suggested ${label}${s.note !== undefined ? `: "${s.note}"` : ""}. ` +
+                    (Guests.modeOf(after) === "weave"
+                      ? "Accept it into the plan where it flows (edit_plan accept), or reject it with a reason."
+                      : "It plays when the plan runs dry, unless you accept it earlier or reject it."),
+                  ...base
+                })
+                : Effect.void
+            case "accepted":
+              return events.publish({
+                type: "suggestion_accepted",
+                detail: s.placed_by === "gap" ? "The plan ran dry, so dj locked it in to play next" : `${s.placed_by ?? "the driver"} put it in the plan`,
+                ...base
+              })
+            case "played":
+              return events.publish({ type: "suggestion_played", detail: `${s.guest}'s pick is playing`, ...base })
+            default:
+              return events.publish({
+                type: "suggestion_closed",
+                detail: `${s.status}${s.reason !== undefined ? `: ${s.reason}` : ""}`,
+                ...base
+              })
+          }
+        }, { discard: true })
+
+      /** Apply a pure transition atomically, settle guests' suggestions, persist, and wake the feeder. */
       const transact = <A, E>(f: (state: SessionState) => Effect.Effect<readonly [A, SessionState], E>) =>
         lock.withPermit(
           Effect.gen(function*() {
             const before = yield* Ref.get(ref)
-            const [result, after] = yield* f(before)
+            const [result, changed] = yield* f(before)
+            const after = Guests.settle(changed, yield* Clock.currentTimeMillis)
             if (after !== before) {
               yield* Ref.set(ref, after)
               yield* save(after)
+              yield* announce(before, after)
               yield* Queue.offer(poke, undefined)
             }
             return result
@@ -331,6 +401,96 @@ export class Dj extends Context.Service<Dj, {
           return Effect.succeed([next, next] as const)
         })
 
+      // -----------------------------------------------------------------------
+      // Guests: invites and suggestion lanes. Guests never take the lease.
+      // -----------------------------------------------------------------------
+
+      const createInvite = (name: string, minutes: number) =>
+        Effect.gen(function*() {
+          const by = yield* CurrentCaller
+          const now = yield* Clock.currentTimeMillis
+          const code = randomBytes(18).toString("base64url")
+          return yield* transact((state) => {
+            const r = Guests.createInvite(state, { codeHash: hashCode(code), name, minutes, by, now })
+            return r._tag === "Refused"
+              ? Effect.fail(new DjError({ message: r.message }))
+              : Effect.succeed([{ code, invite: r.invite }, r.state] as const)
+          })
+        })
+
+      const revokeInvite = (id: string) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) =>
+          transact((state) => {
+            const next = Guests.revokeInvite(state, id, now)
+            const invite = next?.invites?.find((i) => i.id === id)
+            return next === undefined || invite === undefined
+              ? Effect.fail(new DjError({ message: `No live invite ${id}.` }))
+              : Effect.succeed([invite, next] as const)
+          }))
+
+      const setGuestMode = (mode: GuestMode) =>
+        transact((state) => Effect.succeed([undefined, Guests.modeOf(state) === mode ? state : { ...state, guest_mode: mode }] as const))
+
+      const inviteForCode = (code: string) =>
+        Effect.map(Ref.get(ref), (state) => Option.fromUndefinedOr(Guests.inviteByHash(state, hashCode(code))))
+
+      /** Re-read the invite under the lock: it may have expired or been revoked since the request came in. */
+      const liveInvite = (state: SessionState, invite: Invite, now: number) => {
+        const current = (state.invites ?? []).find((i) => i.id === invite.id)
+        return current !== undefined && Guests.isAlive(current, now)
+          ? Effect.succeed(current)
+          : Effect.fail(new DjError({ message: "This invite has expired or was revoked." }))
+      }
+
+      const suggest = Effect.fn("Dj.suggest")(function*(invite: Invite, songs: ReadonlyArray<SongRequest>) {
+        const resolutions = yield* resolver.resolveAll(songs)
+        yield* cache.remember(resolutions.flatMap((r) => (r._tag === "Resolved" ? [r.track] : [])))
+        const now = yield* Clock.currentTimeMillis
+        const resolved = resolutions.flatMap((r) => (r._tag === "Resolved" ? [r] : []))
+        return yield* transact((state) =>
+          Effect.map(liveInvite(state, invite, now), (current) => {
+            const r = Guests.suggest(state, current, resolved.map((x) => ({ track: x.track, note: x.request.note })), now)
+            const lowConfidence = r.added.flatMap((s) => {
+              const source = resolved.find((x) => x.track.uri === s.track.uri)
+              return source !== undefined && source.confidence < 0.8
+                ? [{ key: s.key, asked: [source.request.title, source.request.artist].filter(Boolean).join(" — "), got: s.track, confidence: source.confidence }]
+                : []
+            })
+            const outcome: SuggestOutcome = {
+              added: r.added,
+              duplicates: r.duplicates,
+              overLimit: r.overLimit,
+              unresolved: resolutions.flatMap((x) => (x._tag === "Unresolved" ? [x] : [])),
+              lowConfidence
+            }
+            return [outcome, r.state] as const
+          })
+        )
+      })
+
+      const withdraw = (invite: Invite, keys: ReadonlyArray<string>) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) =>
+          transact((state) =>
+            Effect.map(liveInvite(state, invite, now), (current) => {
+              const r = Guests.withdraw(state, current, keys, now)
+              return [r, r.state] as const
+            })
+          ))
+
+      const accept = (keys: ReadonlyArray<string>, toIndex: number, takeOver: boolean) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) =>
+          steer(takeOver, (state, by) => {
+            const r = Guests.accept(state, keys, toIndex, by, now)
+            return Effect.succeed([r, r.state] as const)
+          }))
+
+      const reject = (keys: ReadonlyArray<string>, reason: string | undefined, takeOver: boolean) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) =>
+          steer(takeOver, (state) => {
+            const r = Guests.reject(state, keys, reason, now)
+            return Effect.succeed([r, r.state] as const)
+          }))
+
       const control = Effect.fn("Dj.control")(function*(action: ControlAction, volume: Option.Option<number>) {
         switch (action) {
           case "pause":
@@ -398,8 +558,11 @@ export class Dj extends Context.Service<Dj, {
           }
 
           const playbackInfo = { isPlaying: view.isPlaying, remainingMs: view.remainingMs, hidden }
-          if (observed.change._tag !== "SkipCancelled" && Plan.shouldStage(next, playbackInfo)) {
-            const staged = Plan.stageHead(next, now)
+          next = Guests.settle(next, now)
+          // The plan always goes first. Only when it's empty does a guest's suggestion fill the gap, before autoplay would.
+          const fromPlan = Plan.shouldStage(next, playbackInfo)
+          if (observed.change._tag !== "SkipCancelled" && (fromPlan || Guests.shouldFill(next, playbackInfo, now))) {
+            const staged = fromPlan ? Plan.stageHead(next, now) : Guests.stageForGap(next, now)
             if (staged !== undefined) {
               const pushed = yield* Effect.result(
                 api.addToQueue(staged.item.track.uri, view.device.id ?? undefined)
@@ -413,9 +576,11 @@ export class Dj extends Context.Service<Dj, {
             }
           }
 
+          next = Guests.settle(next, now)
           if (next !== state) {
             yield* Ref.set(ref, next)
             yield* save(next)
+            yield* announce(state, next)
           }
           yield* emit(observed.change, view, next)
           return observed.change._tag === "SkipCancelled" ? 1_500 : Plan.nextDelayMs(next, playbackInfo)
@@ -487,7 +652,15 @@ export class Dj extends Context.Service<Dj, {
         move,
         clear,
         control,
-        startPlan
+        startPlan,
+        createInvite,
+        revokeInvite,
+        setGuestMode,
+        inviteForCode,
+        suggest,
+        withdraw,
+        accept,
+        reject
       })
     })
   )

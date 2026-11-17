@@ -259,6 +259,18 @@ const wait = Command.make(
   Command.withExamples([{ command: "vibeq wait --types track_started,skipped,plan_low", description: "Wake when a song changes, is skipped, or the plan runs low" }])
 )
 
+const invite = Command.make(
+  "invite",
+  {
+    name: Argument.String("name").pipe(Argument.withDescription("Who it's for, e.g. sam")),
+    minutes: Flag.Int("minutes").pipe(Flag.withDescription("How long the link works"), Flag.withDefault(60))
+  },
+  ({ name, minutes }) => callTool("invite_guest", { name, minutes }).pipe(Effect.provide(ConfigLive))
+).pipe(
+  Command.withDescription("Make a time-boxed link that lets someone else's agent suggest songs over plain HTTP"),
+  Command.withExamples([{ command: "vibeq invite sam", description: "A one-hour guest link for sam" }])
+)
+
 const now = Command.make("now", {}, () => callTool("now_playing", {}).pipe(Effect.provide(ConfigLive))).pipe(
   Command.withDescription("Shortcut for `call now_playing`")
 )
@@ -331,7 +343,7 @@ const mcpText = (baseUrl: string) => `  Claude Code:     claude mcp add --transp
 
 const root = Command.make("vibeq").pipe(
   Command.withDescription("Agent-driven Spotify DJ"),
-  Command.withSubcommands([serve, login, setup, status, config, tools, call, now, wait, installService, uninstallService])
+  Command.withSubcommands([serve, login, setup, status, config, tools, call, now, wait, invite, installService, uninstallService])
 )
 
 root.pipe(

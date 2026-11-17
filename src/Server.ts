@@ -18,6 +18,7 @@ import { TrackCache } from "./TrackCache.ts"
 import { type PkceChallenge, SpotifyAuth } from "./SpotifyAuth.ts"
 import { VibeToolkit, VibeToolkitLayer } from "./Tools.ts"
 import { WebRoutes } from "./Web.ts"
+import { GuestRoutes } from "./GuestRoutes.ts"
 import { page } from "./Html.ts"
 import { bearerOf, McpAuthMiddleware, McpOAuth, OAuthRoutes, secretMatches } from "./OAuth.ts"
 
@@ -163,7 +164,7 @@ const guardMcp = <E, R>(app: Effect.Effect<HttpServerResponse.HttpServerResponse
 
 /** The long-running daemon: MCP at /mcp, login at /login, public view at /, plus the feeder. */
 export const DaemonLive = HttpRouter.serve(
-  Layer.mergeAll(McpLive, loginRoutes(Effect.void), HealthRoute, OAuthRoutes, WebRoutes.pipe(Layer.provide(VibeToolkitLayer))),
+  Layer.mergeAll(McpLive, loginRoutes(Effect.void), HealthRoute, OAuthRoutes, GuestRoutes, WebRoutes.pipe(Layer.provide(VibeToolkitLayer))),
   { middleware: guardMcp }
 ).pipe(
   Layer.provide(httpServer),

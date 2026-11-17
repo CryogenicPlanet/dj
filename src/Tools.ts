@@ -1,9 +1,11 @@
 import { Clock, Duration, Effect, Layer, Option, Random, Schema, SchemaGetter } from "effect"
 import { Tool, Toolkit } from "effect/ai"
+import { AppConfig } from "./AppConfig.ts"
 import { CurrentCaller } from "./Caller.ts"
 import { Dj } from "./Dj.ts"
-import { type FeedbackEntry, Sentiment, type SpTrack, type Track, toTrack, trackLabel } from "./Domain.ts"
+import { type FeedbackEntry, GuestMode, type Invite, Sentiment, type SpTrack, type Suggestion, type Track, toTrack, trackLabel } from "./Domain.ts"
 import { Feedback } from "./Feedback.ts"
+import * as Guests from "./Guests.ts"
 import { History, statsLabel } from "./History.ts"
 import { Profile } from "./Profile.ts"
 import { LastFm, type SongRef } from "./LastFm.ts"
@@ -93,6 +95,30 @@ const trackOut = (
 
 const planOut = (item: PlanItem): TrackOut => trackOut(item.track, { key: item.key, vibe: item.vibe, note: item.note, by: item.by })
 
+const suggestionOut = (s: Suggestion, now: number) => ({
+  ...trackOut(s.track, { key: s.key, note: s.note, by: Guests.guestBy(s.guest) }),
+  waiting_minutes: Math.max(0, Math.round((now - s.added_at) / 60_000))
+})
+
+const GuestsOut = Schema.Struct({
+  mode: GuestMode,
+  invites: Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String, minutes_left: Schema.Number, created_by: Schema.String })),
+  suggestions: Schema.Array(Schema.Struct({ ...TrackOut.fields, waiting_minutes: Schema.Number })).annotate({
+    description: "Open guest suggestions, oldest first. Accept with edit_plan accept (it renews your lease) or reject with a reason"
+  })
+})
+
+const guestsOut = (state: Plan.SessionState, now: number): typeof GuestsOut.Type => ({
+  mode: Guests.modeOf(state),
+  invites: Guests.liveInvites(state, now).map((i: Invite) => ({
+    id: i.id,
+    name: i.name,
+    minutes_left: Math.max(1, Math.ceil((i.expires_at - now) / 60_000)),
+    created_by: i.created_by
+  })),
+  suggestions: Guests.openSuggestions(state).map((s) => suggestionOut(s, now))
+})
+
 const feedbackOut = (entry: FeedbackEntry) => ({
   sentiment: entry.sentiment,
   when: new Date(entry.at).toISOString().slice(0, 16).replace("T", " "),
@@ -151,6 +177,7 @@ const NowPlaying = Tool.make("now_playing", {
       vibe: Schema.optional(Schema.String),
       by: Schema.optional(Schema.String)
     })),
+    guests: GuestsOut.annotate({ description: "Guests with a live invite link, and their open suggestions" }),
     hints: Schema.Array(Schema.String)
   }),
   failure: ToolError
@@ -224,8 +251,13 @@ const PlayNow = Tool.make("play_now", {
 
 const EditPlan = Tool.make("edit_plan", {
   description:
-    "Edit the upcoming plan by key: remove items, move one item, or clear everything. Removing the locked-in track makes vibeq auto-skip it. Returns the new plan.",
+    "Edit the upcoming plan by key: remove items, move one item, or clear everything. Removing the locked-in track makes vibeq auto-skip it. " +
+    "Also accept guests' suggestions into the plan (keys like 's3', see now_playing.guests) or reject them with a reason the guest sees. Returns the new plan.",
   parameters: Schema.Struct({
+    accept: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Guest suggestion keys to put in the plan, in this order, e.g. ['s3']" }),
+    accept_at: withDefault(Schema.Int, 0, "Plan index for accepted suggestions; 0 = right after the locked-in track. Pick the spot where it flows"),
+    reject: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Guest suggestion keys to turn down" }),
+    reject_reason: Schema.optional(Schema.String).annotate({ description: "Shown to the guest, e.g. 'too fast for the wind-down, try something under 100 BPM'" }),
     remove: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Plan keys to remove, e.g. ['t3','t7']" }),
     move: Schema.optional(Schema.Struct({
       key: Schema.String,
@@ -241,6 +273,8 @@ const EditPlan = Tool.make("edit_plan", {
   }),
   success: Schema.Struct({
     removed: Schema.Array(TrackOut),
+    accepted: Schema.Array(TrackOut),
+    rejected: Schema.Array(Schema.String),
     missing_keys: Schema.Array(Schema.String),
     locked_in: Schema.Array(TrackOut),
     plan: Schema.Array(TrackOut)
@@ -512,6 +546,39 @@ const UpdateProfile = Tool.make("update_profile", {
   failure: ToolError
 })
 
+const InviteGuest = Tool.make("invite_guest", {
+  description:
+    "Give someone else's agent time-boxed access to suggest songs: returns a link to send them. Their agent needs nothing but HTTP: " +
+    "GET the link for instructions. Guests can see what's playing, search, and suggest songs into their own lane. They can't touch the plan, " +
+    "playback or the listener's taste data, and never take the driver lease. Suggestions play when the plan runs dry, or when you accept them into it. " +
+    "Only make one when the listener asks.",
+  parameters: Schema.Struct({
+    name: Schema.String.annotate({ description: "Who it's for, e.g. 'sam'. Shown on their picks and on the live page" }),
+    minutes: withDefault(Schema.Int, Guests.DEFAULT_MINUTES, `How long the link works (max ${Guests.MAX_MINUTES})`)
+  }),
+  success: Schema.Struct({
+    url: Schema.String.annotate({ description: "Send this to the guest. It's a secret: anyone holding it can suggest songs until it expires" }),
+    id: Schema.String,
+    name: Schema.String,
+    expires_at: Schema.String,
+    message: Schema.String.annotate({ description: "Ready-to-send text for the guest" })
+  }),
+  failure: ToolError
+})
+
+const ManageGuests = Tool.make("guests", {
+  description:
+    "List live guest invites and their open suggestions; optionally revoke an invite (by id) or set how suggestions reach the music. " +
+    "mode 'weave' (default): you fit each suggestion into your set within a few tracks, and leftovers fill gaps. 'fill': they only play when the plan runs dry. " +
+    "'off': suggestions wait and never play on their own.",
+  parameters: Schema.Struct({
+    revoke: Schema.optional(Schema.String).annotate({ description: "Invite id to end now, e.g. 'i-1a2b3c4d'" }),
+    mode: Schema.optional(GuestMode)
+  }),
+  success: GuestsOut,
+  failure: ToolError
+})
+
 export const VibeToolkit = Toolkit.make(
   NowPlaying,
   QueueSongs,
@@ -536,7 +603,9 @@ export const VibeToolkit = Toolkit.make(
   FindTracks,
   Transitions,
   Playlists,
-  UpdateProfile
+  UpdateProfile,
+  InviteGuest,
+  ManageGuests
 )
 
 // ---------------------------------------------------------------------------
@@ -546,9 +615,10 @@ export const VibeToolkit = Toolkit.make(
 export const VibeToolkitLayer: Layer.Layer<
   Tool.HandlersFor<typeof VibeToolkit.tools>,
   never,
-  Dj | SpotifyApi | LastFm | Feedback | History | Profile | StatsFm | TrackCache | Events
+  Dj | SpotifyApi | LastFm | Feedback | History | Profile | StatsFm | TrackCache | Events | AppConfig
 > = VibeToolkit.toLayer(
   Effect.gen(function*() {
+    const config = yield* AppConfig
     const dj = yield* Dj
     const api = yield* SpotifyApi
     const lastfm = yield* LastFm
@@ -635,7 +705,18 @@ export const VibeToolkitLayer: Layer.Layer<
             from: Plan.queueSource(state, t)
           }))
           const lockedIndex = spotifyQueue.findIndex((q) => q.from === "dj")
+          const open = Guests.openSuggestions(state)
+          const mode = Guests.modeOf(state)
+          const guestHint = open.length === 0 || mode === "off"
+            ? []
+            : [
+              `${open.length} guest suggestion(s) waiting (${open.slice(0, 3).map((s) => `${s.key} ${trackLabel(s.track)} from ${s.guest}`).join("; ")}). ` +
+              (mode === "weave"
+                ? "Weave each into your set within the next ~3 tracks, where it transitions well: edit_plan accept:[key] accept_at:<index>. Reject with a reason if it doesn't fit the room. Anything left plays when the plan runs dry."
+                : "They play when the plan runs dry. Accept one with edit_plan to place it sooner, or reject it with a reason.")
+            ]
           const hints = [
+            ...guestHint,
             ...(Option.isSome(pb) && Option.isNone(pb.value.track)
               ? ["Spotify isn't reporting the current track (a private session, or a device that hides it). dj keeps the locked-in track queued but can't see what plays until it's visible again."]
               : []),
@@ -678,6 +759,7 @@ export const VibeToolkitLayer: Layer.Layer<
               ...(h.vibe !== undefined ? { vibe: h.vibe } : {}),
               ...(h.by !== undefined ? { by: h.by } : {})
             })),
+            guests: guestsOut(state, now),
             hints
           }
         }).pipe(Effect.mapError(toToolError)),
@@ -745,12 +827,42 @@ export const VibeToolkitLayer: Layer.Layer<
             : undefined
           if (params.move !== undefined) yield* dj.move(params.move.key, params.move.to_index, params.take_over)
           if (params.clear || params.reset_history) yield* dj.clear(params.reset_history, params.take_over)
+          const accepted = params.accept !== undefined && params.accept.length > 0
+            ? yield* dj.accept(params.accept, params.accept_at, params.take_over)
+            : undefined
+          const rejected = params.reject !== undefined && params.reject.length > 0
+            ? yield* dj.reject(params.reject, params.reject_reason, params.take_over)
+            : undefined
           const view = yield* planView
           return {
             removed: (removal?.removed ?? []).map(planOut),
-            missing_keys: removal?.missing ?? [],
+            accepted: (accepted?.items ?? []).map(planOut),
+            rejected: (rejected?.changed ?? []).map((s) => `${s.key} ${trackLabel(s.track)}`),
+            missing_keys: [...(removal?.missing ?? []), ...(accepted?.missing ?? []), ...(rejected?.missing ?? [])],
             ...view
           }
+        }).pipe(Effect.mapError(toToolError)),
+
+      invite_guest: ({ name, minutes }) =>
+        Effect.gen(function*() {
+          const { code, invite } = yield* dj.createInvite(name, minutes)
+          const url = `${config.publicUrl}/g/${code}`
+          const until = new Date(invite.expires_at).toISOString().slice(0, 16).replace("T", " ") + "Z"
+          const mins = Math.round((invite.expires_at - invite.created_at) / 60_000)
+          return {
+            url,
+            id: invite.id,
+            name: invite.name,
+            expires_at: until,
+            message: `You can suggest songs for the next ${mins} min. Give your agent this link and ask it to read it: ${url}`
+          }
+        }).pipe(Effect.mapError(toToolError)),
+
+      guests: ({ revoke, mode }) =>
+        Effect.gen(function*() {
+          if (revoke !== undefined) yield* dj.revokeInvite(revoke)
+          if (mode !== undefined) yield* dj.setGuestMode(mode)
+          return guestsOut(yield* dj.state, yield* Clock.currentTimeMillis)
         }).pipe(Effect.mapError(toToolError)),
 
       playback: ({ action, volume }) =>

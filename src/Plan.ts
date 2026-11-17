@@ -200,7 +200,8 @@ export const observeCurrent = (
     started_at: now,
     source: match === undefined ? "other" : "plan",
     ...(match?.item.vibe !== undefined ? { vibe: match.item.vibe } : {}),
-    ...(match?.item.by !== undefined ? { by: match.item.by } : {})
+    ...(match?.item.by !== undefined ? { by: match.item.by } : {}),
+    ...(match !== undefined ? { key: match.item.key } : {})
   }
   // Conservative: pauses inflate elapsed time, so a paused track never looks skipped.
   const last = base.history.at(-1)
@@ -273,7 +274,8 @@ export const reconcileStaged = (
         source: "plan",
         unseen: true,
         ...(r.item.vibe !== undefined ? { vibe: r.item.vibe } : {}),
-        ...(r.item.by !== undefined ? { by: r.item.by } : {})
+        ...(r.item.by !== undefined ? { by: r.item.by } : {}),
+        key: r.item.key
       }]
       : []
   )

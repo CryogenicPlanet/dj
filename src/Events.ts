@@ -6,7 +6,20 @@ import { Clock, Context, Deferred, Duration, Effect, Layer, Ref, Schema } from "
  * react the moment a song starts, gets skipped, or the plan runs low.
  */
 
-export const EventType = Schema.Literals(["track_started", "skipped", "plan_low", "plan_empty", "paused", "resumed", "driver_changed", "queue_repaired"])
+export const EventType = Schema.Literals([
+  "track_started",
+  "skipped",
+  "plan_low",
+  "plan_empty",
+  "paused",
+  "resumed",
+  "driver_changed",
+  "queue_repaired",
+  "suggestion_added",
+  "suggestion_accepted",
+  "suggestion_played",
+  "suggestion_closed"
+])
 export type EventType = typeof EventType.Type
 
 export const VibeEvent = Schema.Struct({
@@ -18,6 +31,9 @@ export const VibeEvent = Schema.Struct({
   source: Schema.optional(Schema.String),
   vibe: Schema.optional(Schema.String),
   detail: Schema.optional(Schema.String),
+  /** For suggestion events: the guest it belongs to, and its key (e.g. "s3"). */
+  guest: Schema.optional(Schema.String),
+  key: Schema.optional(Schema.String),
   plan_remaining: Schema.Number,
   plan_minutes: Schema.Number
 })
