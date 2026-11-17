@@ -96,7 +96,7 @@ const trackOut = (
 const planOut = (item: PlanItem): TrackOut => trackOut(item.track, { key: item.key, vibe: item.vibe, note: item.note, by: item.by })
 
 const suggestionOut = (s: Suggestion, now: number) => ({
-  ...trackOut(s.track, { key: s.key, note: s.note, by: Guests.guestBy(s.guest) }),
+  ...trackOut(s.track, { key: s.key, note: s.note === undefined ? undefined : Guests.guestNote(s.note), by: Guests.guestBy(s.guest) }),
   waiting_minutes: Math.max(0, Math.round((now - s.added_at) / 60_000))
 })
 
@@ -108,7 +108,10 @@ const GuestsOut = Schema.Struct({
   })
 })
 
-const guestsOut = (state: Plan.SessionState, now: number): typeof GuestsOut.Type => ({
+const guestsOut = (raw: Plan.SessionState, now: number): typeof GuestsOut.Type => {
+  // Settled for display, so lapsed invites and their suggestions never show as acceptable.
+  const state = Guests.settle(raw, now)
+  return {
   mode: Guests.modeOf(state),
   invites: Guests.liveInvites(state, now).map((i: Invite) => ({
     id: i.id,
@@ -116,8 +119,9 @@ const guestsOut = (state: Plan.SessionState, now: number): typeof GuestsOut.Type
     minutes_left: Math.max(1, Math.ceil((i.expires_at - now) / 60_000)),
     created_by: i.created_by
   })),
-  suggestions: Guests.openSuggestions(state).map((s) => suggestionOut(s, now))
-})
+  suggestions: Guests.liveOpen(state, now).map((s) => suggestionOut(s, now))
+  }
+}
 
 const feedbackOut = (entry: FeedbackEntry) => ({
   sentiment: entry.sentiment,
@@ -573,7 +577,8 @@ const ManageGuests = Tool.make("guests", {
     "'off': suggestions wait and never play on their own.",
   parameters: Schema.Struct({
     revoke: Schema.optional(Schema.String).annotate({ description: "Invite id to end now, e.g. 'i-1a2b3c4d'" }),
-    mode: Schema.optional(GuestMode)
+    mode: Schema.optional(GuestMode).annotate({ description: "Changing it needs the driver lease, like a plan change" }),
+    take_over: withDefault(Schema.Boolean, false, "Change the mode even though another agent is driving. Only when the listener asked you to")
   }),
   success: GuestsOut,
   failure: ToolError
@@ -705,7 +710,7 @@ export const VibeToolkitLayer: Layer.Layer<
             from: Plan.queueSource(state, t)
           }))
           const lockedIndex = spotifyQueue.findIndex((q) => q.from === "dj")
-          const open = Guests.openSuggestions(state)
+          const open = Guests.liveOpen(state, now)
           const mode = Guests.modeOf(state)
           const guestHint = open.length === 0 || mode === "off"
             ? []
@@ -858,10 +863,10 @@ export const VibeToolkitLayer: Layer.Layer<
           }
         }).pipe(Effect.mapError(toToolError)),
 
-      guests: ({ revoke, mode }) =>
+      guests: ({ revoke, mode, take_over }) =>
         Effect.gen(function*() {
           if (revoke !== undefined) yield* dj.revokeInvite(revoke)
-          if (mode !== undefined) yield* dj.setGuestMode(mode)
+          if (mode !== undefined) yield* dj.setGuestMode(mode, take_over)
           return guestsOut(yield* dj.state, yield* Clock.currentTimeMillis)
         }).pipe(Effect.mapError(toToolError)),
 

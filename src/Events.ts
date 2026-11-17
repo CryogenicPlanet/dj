@@ -33,6 +33,8 @@ export const VibeEvent = Schema.Struct({
   detail: Schema.optional(Schema.String),
   /** For suggestion events: the guest it belongs to, and its key (e.g. "s3"). */
   guest: Schema.optional(Schema.String),
+  /** For suggestion events: the invite it came through. Guests' /wait filters on this, not the reusable name. */
+  invite: Schema.optional(Schema.String),
   key: Schema.optional(Schema.String),
   plan_remaining: Schema.Number,
   plan_minutes: Schema.Number

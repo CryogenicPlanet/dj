@@ -1,7 +1,7 @@
 import { Clock, Duration, Effect, Option, Ref, Schema } from "effect"
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { AppConfig } from "./AppConfig.ts"
-import { Dj } from "./Dj.ts"
+import { Dj, DjError, type PlaybackView } from "./Dj.ts"
 import { type Invite, type Suggestion, type Track, toTrack, trackLabel } from "./Domain.ts"
 import { type EventType, Events, type VibeEvent } from "./Events.ts"
 import * as Guests from "./Guests.ts"
@@ -16,9 +16,24 @@ import { SpotifyApi } from "./SpotifyApi.ts"
  * they can't touch the plan, playback, or the listener's taste data, and never take the driver lease.
  */
 
-/** Requests per guest per minute, across every guest endpoint. */
-const RATE_PER_MINUTE = 60
-const MAX_SONGS_PER_CALL = 10
+/**
+ * Per-minute budgets. Every guest shares the owner's Spotify quota with the feeder, so calls that reach Spotify
+ * get their own small budget per guest plus one shared by all guests: a guest must never starve playback.
+ */
+const BUDGETS = {
+  /** Any guest request, per guest. */
+  any: 60,
+  /** /search, per guest. */
+  search: 10,
+  /** /suggest and /withdraw, per guest. */
+  change: 10,
+  /** Requests that reach Spotify, across all guests. */
+  spotify: 40
+} as const
+type Bucket = keyof typeof BUDGETS
+const MAX_SONGS_PER_CALL = 5
+/** /now reads playback at most this often, shared by every guest. */
+const PLAYBACK_CACHE_MS = 5_000
 
 const SuggestBody = Schema.Struct({
   songs: Schema.Array(SongRequest)
@@ -56,14 +71,33 @@ const suggestionBrief = (s: Suggestion) => ({
   ...(s.status === "accepted" ? { placed: s.placed_by === "gap" ? "locked in to fill a gap" : "in the DJ's plan" } : {})
 })
 
-const guestEvent = (e: VibeEvent) => ({
-  seq: e.seq,
-  at: e.at,
-  type: e.type,
-  ...(e.track !== undefined ? { track: e.track } : {}),
-  ...(e.key !== undefined ? { key: e.key } : {}),
-  ...(e.detail !== undefined && e.type !== "suggestion_added" ? { detail: e.detail } : {})
-})
+/** What a guest may read of an event. Details are rewritten so the owner's agents aren't named. */
+const guestDetail = (e: VibeEvent): string | undefined => {
+  switch (e.type) {
+    case "suggestion_accepted":
+      return e.source === "gap" ? "locked in to fill a gap in the DJ's plan; it plays next" : "the DJ put it in the plan"
+    case "suggestion_played":
+      return "playing now"
+    case "suggestion_closed":
+      return e.detail
+    case "skipped":
+      return e.detail
+    default:
+      return undefined
+  }
+}
+
+const guestEvent = (e: VibeEvent) => {
+  const detail = guestDetail(e)
+  return {
+    seq: e.seq,
+    at: e.at,
+    type: e.type,
+    ...(e.track !== undefined ? { track: e.track } : {}),
+    ...(e.key !== undefined ? { key: e.key } : {}),
+    ...(detail !== undefined ? { detail } : {})
+  }
+}
 
 const guideText = (base: string, invite: Invite, mode: string, now: number) => `# You're a guest DJ
 
@@ -73,7 +107,8 @@ Everything below is plain HTTP with JSON. This link is the credential, so keep i
 ## How it works
 - Another agent is the DJ. It owns the plan (what plays next) and you can't change it. You suggest songs into your own lane, and the DJ decides.
 - ${mode}
-- Up to ${Guests.MAX_OPEN_PER_GUEST} suggestions can wait at once. Songs already played, planned or suggested are skipped.
+- Up to ${Guests.MAX_OPEN_PER_GUEST} suggestions can wait at once, and tracks up to ${Guests.MAX_TRACK_MS / 60_000} min. Songs already played, planned or suggested (including your own earlier picks) are skipped.
+- Budgets per minute: ${BUDGETS.any} requests, ${BUDGETS.search} searches, ${BUDGETS.change} suggest or withdraw calls. Use /wait rather than polling.
 - Read the room before you pick: call /now, match what's playing, and say why in \`note\`. The DJ reads your notes and can reject a pick with a reason you'll see.
 
 ## Endpoints
@@ -108,6 +143,40 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
   const api = yield* SpotifyApi
   const events = yield* Events
   const hits = yield* Ref.make<ReadonlyMap<string, { readonly window: number; readonly count: number }>>(new Map())
+  const playbackCache = yield* Ref.make<{ readonly at: number; readonly view: Option.Option<PlaybackView> }>({ at: 0, view: Option.none() })
+
+  /** Count one request against a budget; false when it's used up this minute. Old windows are dropped as they pass. */
+  const spend = (bucket: Bucket, who: string, now: number) =>
+    Ref.modify(hits, (m) => {
+      const window = Math.floor(now / 60_000)
+      const key = `${bucket}:${who}`
+      const prev = m.get(key)
+      const count = prev !== undefined && prev.window === window ? prev.count + 1 : 1
+      const fresh = new Map([...m].filter(([, v]) => v.window === window))
+      fresh.set(key, { window, count })
+      return [count <= BUDGETS[bucket], fresh] as const
+    })
+
+  /** Spend a per-guest budget, and for Spotify-backed calls the shared one too. */
+  const budget = (g: Guest, bucket: Exclude<Bucket, "any" | "spotify">, spotify: boolean) =>
+    Effect.gen(function*() {
+      if (!(yield* spend(bucket, g.invite.id, g.now))) {
+        return Option.some(fail(429, "slow_down", `At most ${BUDGETS[bucket]} ${bucket === "search" ? "searches" : "suggest or withdraw calls"} a minute.`))
+      }
+      if (spotify && !(yield* spend("spotify", "all", g.now))) {
+        return Option.some(fail(429, "busy", "Guests are using a lot of Spotify right now. Try again in a minute."))
+      }
+      return Option.none<HttpServerResponse.HttpServerResponse>()
+    })
+
+  const cachedPlayback = (now: number) =>
+    Effect.gen(function*() {
+      const cached = yield* Ref.get(playbackCache)
+      if (now - cached.at < PLAYBACK_CACHE_MS) return cached.view
+      const view = yield* dj.playback.pipe(Effect.option, Effect.map(Option.flatten))
+      yield* Ref.set(playbackCache, { at: now, view })
+      return view
+    })
 
   const modeLine = (mode: ReturnType<typeof Guests.modeOf>): string =>
     mode === "off"
@@ -128,13 +197,9 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const invite = found.value
       if (invite.revoked === true) return { _tag: "No" as const, response: fail(410, "invite_revoked", "The DJ's owner ended this invite.") }
       if (!Guests.isAlive(invite, now)) return { _tag: "No" as const, response: fail(410, "invite_expired", `This invite expired at ${utc(invite.expires_at)}.`) }
-      const window = Math.floor(now / 60_000)
-      const used = yield* Ref.modify(hits, (m) => {
-        const prev = m.get(invite.id)
-        const count = prev !== undefined && prev.window === window ? prev.count + 1 : 1
-        return [count, new Map([...m, [invite.id, { window, count }]])] as const
-      })
-      if (used > RATE_PER_MINUTE) return { _tag: "No" as const, response: fail(429, "slow_down", `At most ${RATE_PER_MINUTE} requests a minute. Use /wait instead of polling.`) }
+      if (!(yield* spend("any", invite.id, now))) {
+        return { _tag: "No" as const, response: fail(429, "slow_down", `At most ${BUDGETS.any} requests a minute. Use /wait instead of polling.`) }
+      }
       yield* Effect.logInfo(`guest ${invite.name} (${invite.id}): ${request.method} ${new URL(request.url, "http://x").pathname.split("/").slice(3).join("/") || "guide"}`)
       return { _tag: "Yes" as const, invite, now, base: `${config.publicUrl}/g/${code}` }
     })
@@ -142,7 +207,12 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
   const withGuest = <E, R>(handler: (g: Guest, request: HttpServerRequest.HttpServerRequest) => Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
     (request: HttpServerRequest.HttpServerRequest) =>
       Effect.flatMap(guest(request), (g) => (g._tag === "No" ? Effect.succeed(g.response) : handler(g, request))).pipe(
-        Effect.catch((e) => Effect.succeed(fail(502, "dj_error", e instanceof Error ? e.message : String(e))))
+        // A DjError is the guest's to fix (lane full, invite lapsed); anything else is Spotify or dj failing.
+        Effect.catch((e) =>
+          Effect.succeed(e instanceof DjError ? fail(409, "refused", e.message) : fail(502, "dj_error", e instanceof Error ? e.message : String(e)))
+        ),
+        // The code in the path is a bearer secret: keep these requests out of the HTTP request log.
+        HttpMiddleware.withLoggerDisabled
       )
 
   const mine = (invite: Invite, suggestions: ReadonlyArray<Suggestion>) => suggestions.filter((s) => s.invite === invite.id)
@@ -164,7 +234,7 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
   yield* router.add("GET", "/g/:code/now", withGuest((g) =>
     Effect.gen(function*() {
       const state = yield* dj.state
-      const pb = yield* dj.playback.pipe(Effect.option, Effect.map(Option.flatten))
+      const pb = yield* cachedPlayback(g.now)
       const driver = Plan.activeDriver(state, g.now)
       const locked = Plan.activeStaged(state).map((s) => s.item)
       return json({
@@ -199,6 +269,8 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const q = (params.get("q") ?? "").trim()
       if (q === "") return fail(400, "missing_query", `GET ${g.base}/search?q=<query>`)
       const limit = Math.max(1, Math.min(10, Number.parseInt(params.get("limit") ?? "8", 10) || 8))
+      const refused = yield* budget(g, "search", true)
+      if (Option.isSome(refused)) return refused.value
       const found = yield* api.searchTracks(q.slice(0, 200), { limit, offset: 0 })
       return json({ ok: true, results: found.tracks.items.flatMap((t) => (t === null ? [] : [trackBrief(toTrack(t))])) })
     })
@@ -212,11 +284,14 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
       }
       const songs = body.value.songs
       if (songs.length > MAX_SONGS_PER_CALL) return fail(400, "too_many", `Up to ${MAX_SONGS_PER_CALL} songs per call.`)
+      const refused = yield* budget(g, "change", true)
+      if (Option.isSome(refused)) return refused.value
       const outcome = yield* dj.suggest(g.invite, songs)
       const open = mine(g.invite, Guests.openSuggestions(yield* dj.state)).length
       const parts = [
         `${outcome.added.length} suggested.`,
         outcome.duplicates.length > 0 ? `${outcome.duplicates.length} already played, planned or suggested.` : "",
+        outcome.tooLong.length > 0 ? `${outcome.tooLong.length} longer than ${Guests.MAX_TRACK_MS / 60_000} min.` : "",
         outcome.overLimit.length > 0 ? `${outcome.overLimit.length} over your limit of ${Guests.MAX_OPEN_PER_GUEST} waiting; withdraw one or wait for some to play.` : "",
         outcome.unresolved.length > 0 ? `${outcome.unresolved.length} not found; try /search.` : "",
         `${open} waiting now.`
@@ -228,6 +303,7 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
         check_these: outcome.lowConfidence.map((l) => ({ key: l.key, asked: l.asked, got: trackLabel(l.got), confidence: l.confidence })),
         duplicates: outcome.duplicates.map(trackLabel),
         over_limit: outcome.overLimit.map(trackLabel),
+        too_long: outcome.tooLong.map(trackLabel),
         not_found: outcome.unresolved.map((u) => ({
           asked: [u.request.title, u.request.artist, u.request.uri].filter(Boolean).join(" — "),
           reason: u.reason,
@@ -242,7 +318,12 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
   ))
 
   const withdrawKeys = (g: Guest, keys: ReadonlyArray<string>) =>
-    Effect.map(dj.withdraw(g.invite, keys), (r) => json({ ok: true, withdrawn: r.changed.map((s) => s.key), not_open: r.missing }))
+    Effect.gen(function*() {
+      const refused = yield* budget(g, "change", false)
+      if (Option.isSome(refused)) return refused.value
+      const r = yield* dj.withdraw(g.invite, keys.slice(0, 20))
+      return json({ ok: true, withdrawn: r.changed.map((s) => s.key), not_open: r.missing })
+    })
 
   yield* router.add("POST", "/g/:code/withdraw", withGuest((g, request) =>
     Effect.gen(function*() {
@@ -263,7 +344,7 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
       const sinceParam = params.get("since")
       const start = sinceParam === null ? yield* events.cursor : Number.parseInt(sinceParam, 10) || 0
       const deadline = g.now + timeout * 1000
-      const visible = (e: VibeEvent) => PUBLIC_EVENTS.includes(e.type) || (SUGGESTION_EVENTS.includes(e.type) && e.guest === g.invite.name)
+      const visible = (e: VibeEvent) => PUBLIC_EVENTS.includes(e.type) || (SUGGESTION_EVENTS.includes(e.type) && e.invite === g.invite.id)
       // Other guests' events wake the wait too; keep waiting until one of ours arrives or time runs out.
       const loop = (since: number): Effect.Effect<{ readonly events: ReadonlyArray<VibeEvent>; readonly cursor: number }> =>
         Effect.gen(function*() {

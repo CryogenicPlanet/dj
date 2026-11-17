@@ -1,7 +1,7 @@
 import { BunHttpServer, BunServices } from "@effect/platform-bun"
 import { Clock, Effect, Layer, Option, Ref, Schema } from "effect"
 import { McpProtocol, McpServer } from "effect/ai"
-import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { FetchHttpClient, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { AppConfig } from "./AppConfig.ts"
 import { Dj } from "./Dj.ts"
 import { Feedback } from "./Feedback.ts"
@@ -168,6 +168,8 @@ export const DaemonLive = HttpRouter.serve(
   { middleware: guardMcp }
 ).pipe(
   Layer.provide(httpServer),
+  // Guest links carry their secret in the path, so their requests are never traced (they're also kept out of the log).
+  Layer.provide(Layer.succeed(HttpMiddleware.TracerDisabledWhen)((request) => request.url.startsWith("/g/"))),
   Layer.provideMerge(McpOAuth.layer),
   Layer.provide(AppLive)
 )

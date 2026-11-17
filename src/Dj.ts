@@ -57,6 +57,7 @@ export interface SuggestOutcome {
   readonly added: ReadonlyArray<Suggestion>
   readonly duplicates: ReadonlyArray<Track>
   readonly overLimit: ReadonlyArray<Track>
+  readonly tooLong: ReadonlyArray<Track>
   readonly unresolved: ReadonlyArray<Extract<Resolution, { _tag: "Unresolved" }>>
   readonly lowConfidence: ReadonlyArray<{ readonly key: string; readonly asked: string; readonly got: Track; readonly confidence: number }>
 }
@@ -87,7 +88,8 @@ export class Dj extends Context.Service<Dj, {
   /** Mint a guest link's code. Owner-side: any caller with write access, never a guest. */
   readonly createInvite: (name: string, minutes: number) => Effect.Effect<{ readonly code: string; readonly invite: Invite }, DjError>
   readonly revokeInvite: (id: string) => Effect.Effect<Invite, DjError>
-  readonly setGuestMode: (mode: GuestMode) => Effect.Effect<void>
+  /** Whether guest picks play changes what plays, so it needs the lease like any other plan change. */
+  readonly setGuestMode: (mode: GuestMode, takeOver: boolean) => Effect.Effect<void, DjError>
   /** The invite a link's code belongs to, alive or not. */
   readonly inviteForCode: (code: string) => Effect.Effect<Option.Option<Invite>>
   readonly suggest: (invite: Invite, songs: ReadonlyArray<SongRequest>) => Effect.Effect<SuggestOutcome, DjFailure>
@@ -175,13 +177,13 @@ export class Dj extends Context.Service<Dj, {
       const announce = (before: SessionState, after: SessionState) =>
         Effect.forEach(Guests.changes(before, after), ({ suggestion: s, was }) => {
           const label = trackLabel(s.track)
-          const base = { track: label, uri: s.track.uri, guest: s.guest, key: s.key, ...planStats(after) }
+          const base = { track: label, uri: s.track.uri, guest: s.guest, invite: s.invite, key: s.key, ...planStats(after) }
           switch (s.status) {
             case "open":
               return was === undefined
                 ? events.publish({
                   type: "suggestion_added",
-                  detail: `${s.guest} (guest) suggested ${label}${s.note !== undefined ? `: "${s.note}"` : ""}. ` +
+                  detail: `${s.guest} (guest) suggested ${label}.${s.note !== undefined ? ` ${Guests.guestNote(JSON.stringify(s.note))}.` : ""} ` +
                     (Guests.modeOf(after) === "weave"
                       ? "Accept it into the plan where it flows (edit_plan accept), or reject it with a reason."
                       : "It plays when the plan runs dry, unless you accept it earlier or reject it."),
@@ -191,6 +193,7 @@ export class Dj extends Context.Service<Dj, {
             case "accepted":
               return events.publish({
                 type: "suggestion_accepted",
+                source: s.placed_by === "gap" ? "gap" : "plan",
                 detail: s.placed_by === "gap" ? "The plan ran dry, so dj locked it in to play next" : `${s.placed_by ?? "the driver"} put it in the plan`,
                 ...base
               })
@@ -210,8 +213,10 @@ export class Dj extends Context.Service<Dj, {
         lock.withPermit(
           Effect.gen(function*() {
             const before = yield* Ref.get(ref)
-            const [result, changed] = yield* f(before)
-            const after = Guests.settle(changed, yield* Clock.currentTimeMillis)
+            const now = yield* Clock.currentTimeMillis
+            // Settle first too, so nothing acts on a suggestion whose invite has already lapsed.
+            const [result, changed] = yield* f(Guests.settle(before, now))
+            const after = Guests.settle(changed, now)
             if (after !== before) {
               yield* Ref.set(ref, after)
               yield* save(after)
@@ -428,8 +433,8 @@ export class Dj extends Context.Service<Dj, {
               : Effect.succeed([invite, next] as const)
           }))
 
-      const setGuestMode = (mode: GuestMode) =>
-        transact((state) => Effect.succeed([undefined, Guests.modeOf(state) === mode ? state : { ...state, guest_mode: mode }] as const))
+      const setGuestMode = (mode: GuestMode, takeOver: boolean) =>
+        steer(takeOver, (state) => Effect.succeed([undefined, Guests.modeOf(state) === mode ? state : { ...state, guest_mode: mode }] as const))
 
       const inviteForCode = (code: string) =>
         Effect.map(Ref.get(ref), (state) => Option.fromUndefinedOr(Guests.inviteByHash(state, hashCode(code))))
@@ -443,7 +448,14 @@ export class Dj extends Context.Service<Dj, {
       }
 
       const suggest = Effect.fn("Dj.suggest")(function*(invite: Invite, songs: ReadonlyArray<SongRequest>) {
-        const resolutions = yield* resolver.resolveAll(songs)
+        // Check the lane has room before spending Spotify lookups on songs that couldn't be added anyway.
+        const room = Guests.roomFor(yield* Ref.get(ref), invite)
+        if (room === 0) {
+          return yield* new DjError({
+            message: `You already have ${Guests.MAX_OPEN_PER_GUEST} suggestions waiting. Withdraw one, or wait for one to play or be turned down.`
+          })
+        }
+        const resolutions = yield* resolver.resolveAll(songs.slice(0, room))
         yield* cache.remember(resolutions.flatMap((r) => (r._tag === "Resolved" ? [r.track] : [])))
         const now = yield* Clock.currentTimeMillis
         const resolved = resolutions.flatMap((r) => (r._tag === "Resolved" ? [r] : []))
@@ -460,6 +472,7 @@ export class Dj extends Context.Service<Dj, {
               added: r.added,
               duplicates: r.duplicates,
               overLimit: r.overLimit,
+              tooLong: r.tooLong,
               unresolved: resolutions.flatMap((x) => (x._tag === "Unresolved" ? [x] : [])),
               lowConfidence
             }
@@ -524,7 +537,16 @@ export class Dj extends Context.Service<Dj, {
           const pb = yield* api.playbackState
           const now = yield* Clock.currentTimeMillis
           const state = yield* Ref.get(ref)
-          if (Option.isNone(pb)) return Plan.nextDelayMs(state, undefined)
+          if (Option.isNone(pb)) {
+            // No device: still let guests' suggestions expire on time.
+            const settled = Guests.settle(state, now)
+            if (settled !== state) {
+              yield* Ref.set(ref, settled)
+              yield* save(settled)
+              yield* announce(state, settled)
+            }
+            return Plan.nextDelayMs(settled, undefined)
+          }
           const view = toView(pb.value)
 
           const observed = Plan.observeCurrent(state, Option.getOrUndefined(view.track), now)
@@ -562,7 +584,8 @@ export class Dj extends Context.Service<Dj, {
           // The plan always goes first. Only when it's empty does a guest's suggestion fill the gap, before autoplay would.
           const fromPlan = Plan.shouldStage(next, playbackInfo)
           if (observed.change._tag !== "SkipCancelled" && (fromPlan || Guests.shouldFill(next, playbackInfo, now))) {
-            const staged = fromPlan ? Plan.stageHead(next, now) : Guests.stageForGap(next, now)
+            const gap = fromPlan ? undefined : Guests.stageForGap(next, now)
+            const staged = fromPlan ? Plan.stageHead(next, now) : gap
             if (staged !== undefined) {
               const pushed = yield* Effect.result(
                 api.addToQueue(staged.item.track.uri, view.device.id ?? undefined)
@@ -572,6 +595,7 @@ export class Dj extends Context.Service<Dj, {
                 next = staged.state
               } else {
                 yield* Effect.logWarning(`Failed to stage ${staged.item.track.name}: ${pushed.failure.message}`)
+                if (gap !== undefined) next = Guests.fillFailed(next, gap.suggestion.key, now)
               }
             }
           }

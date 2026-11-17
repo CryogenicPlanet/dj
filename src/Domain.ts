@@ -272,7 +272,9 @@ export const Suggestion = Schema.Struct({
   plan_key: Schema.optional(Schema.String),
   /** Who placed it: the driver, or "gap" when the feeder played it because the plan ran dry. */
   placed_by: Schema.optional(Schema.String),
-  closed_at: Schema.optional(Schema.Number)
+  closed_at: Schema.optional(Schema.Number),
+  /** Times Spotify refused to queue it for a gap. */
+  fill_failures: Schema.optional(Schema.Number)
 })
 export type Suggestion = typeof Suggestion.Type
 
