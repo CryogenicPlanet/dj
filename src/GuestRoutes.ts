@@ -233,6 +233,8 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
 
   yield* router.add("GET", "/g/:code/now", withGuest((g) =>
     Effect.gen(function*() {
+      // Cursor first: anything that lands after it, even mid-request, still reaches the guest's next /wait.
+      const cursor = yield* events.cursor
       const state = yield* dj.state
       const pb = yield* cachedPlayback(g.now)
       const driver = Plan.activeDriver(state, g.now)
@@ -258,7 +260,7 @@ export const GuestRoutes = HttpRouter.use(Effect.fn(function*(router) {
         })),
         recent: state.history.slice(-8).toReversed().map((h) => trackLabel(h.track)),
         your_suggestions: mine(g.invite, Guests.suggestionsOf(state)).filter((s) => s.status === "open" || s.status === "accepted").map(suggestionBrief),
-        cursor: yield* events.cursor
+        cursor
       })
     })
   ))

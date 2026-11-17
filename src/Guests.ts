@@ -339,7 +339,8 @@ export const fillFailed = (state: SessionState, key: string, now: number): Sessi
 // ---------------------------------------------------------------------------
 
 /**
- * Bring suggestions up to date: open ones from a dead invite expire, accepted ones become "played" once their
+ * Bring suggestions up to date: open ones from a dead invite expire, open ones the DJ played or planned on its own
+ * are dropped as repeats, accepted ones become "played" once their
  * plan item played, or "dropped" if the plan lost it. Old closed ones and long-dead invites are forgotten.
  * Returns `state` itself when nothing changed.
  */
@@ -357,6 +358,8 @@ export const settle = (state: SessionState, now: number): SessionState => {
       if (invite === undefined || !isAlive(invite, now)) {
         return close(s, "expired", now, invite?.revoked === true ? "invite revoked" : "invite expired")
       }
+      // The DJ played or planned it some other way (queue_songs, play_now): don't queue it a second time.
+      if (Plan.isDuplicate(state, s.track)) return close(s, "dropped", now, "the DJ already played or planned it")
       return s
     }
     if (s.status === "accepted" && s.plan_key !== undefined) {

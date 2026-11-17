@@ -457,10 +457,10 @@ export class Dj extends Context.Service<Dj, {
         }
         const resolutions = yield* resolver.resolveAll(songs.slice(0, room))
         yield* cache.remember(resolutions.flatMap((r) => (r._tag === "Resolved" ? [r.track] : [])))
-        const now = yield* Clock.currentTimeMillis
         const resolved = resolutions.flatMap((r) => (r._tag === "Resolved" ? [r] : []))
+        // The time is read under the lock: the feeder may have held it past the invite's expiry.
         return yield* transact((state) =>
-          Effect.map(liveInvite(state, invite, now), (current) => {
+          Effect.flatMap(Clock.currentTimeMillis, (now) => Effect.map(liveInvite(state, invite, now), (current) => {
             const r = Guests.suggest(state, current, resolved.map((x) => ({ track: x.track, note: x.request.note })), now)
             const lowConfidence = r.added.flatMap((s) => {
               const source = resolved.find((x) => x.track.uri === s.track.uri)
@@ -477,31 +477,32 @@ export class Dj extends Context.Service<Dj, {
               lowConfidence
             }
             return [outcome, r.state] as const
-          })
+          }))
         )
       })
 
+      // These read the time under the lock too, so a wait on the feeder can't validate against a stale clock.
       const withdraw = (invite: Invite, keys: ReadonlyArray<string>) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) =>
-          transact((state) =>
+        transact((state) =>
+          Effect.flatMap(Clock.currentTimeMillis, (now) =>
             Effect.map(liveInvite(state, invite, now), (current) => {
               const r = Guests.withdraw(state, current, keys, now)
               return [r, r.state] as const
-            })
-          ))
+            }))
+        )
 
       const accept = (keys: ReadonlyArray<string>, toIndex: number, takeOver: boolean) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) =>
-          steer(takeOver, (state, by) => {
+        steer(takeOver, (state, by) =>
+          Effect.map(Clock.currentTimeMillis, (now) => {
             const r = Guests.accept(state, keys, toIndex, by, now)
-            return Effect.succeed([r, r.state] as const)
+            return [r, r.state] as const
           }))
 
       const reject = (keys: ReadonlyArray<string>, reason: string | undefined, takeOver: boolean) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) =>
-          steer(takeOver, (state) => {
+        steer(takeOver, (state) =>
+          Effect.map(Clock.currentTimeMillis, (now) => {
             const r = Guests.reject(state, keys, reason, now)
-            return Effect.succeed([r, r.state] as const)
+            return [r, r.state] as const
           }))
 
       const control = Effect.fn("Dj.control")(function*(action: ControlAction, volume: Option.Option<number>) {

@@ -218,6 +218,16 @@ describe("settle", () => {
     expect(Guests.inviteByHash(Guests.settle(state, 3 * 24 * 60 * MIN), inv.code_hash)).toBeDefined()
   })
 
+  test("an open suggestion the DJ plays on its own is dropped, so a gap can't repeat it", () => {
+    const { state, invite: inv } = invite(emptySession, "sam")
+    const s = steering(suggest(state, inv, ["A", "B"]).state)
+    const playedA = Plan.observeCurrent(Plan.stageImmediate(s, { track: track("A") }, 1).state, track("A"), 2).state
+    const settled = Guests.settle(playedA, LATER)
+    expect(Guests.suggestionsOf(settled).map((x) => x.status)).toEqual(["dropped", "open"])
+    expect(Guests.stageForGap(settled, LATER)?.item.track.name).toBe("B")
+    expect(Guests.accept(settled, ["s1"], 0, "claude-code", LATER).missing).toEqual(["s1"])
+  })
+
   test("returns the same state when nothing changed", () => {
     const { state, invite: inv } = invite(emptySession, "sam")
     const s = suggest(state, inv, ["A"]).state
